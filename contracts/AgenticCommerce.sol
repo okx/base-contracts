@@ -536,7 +536,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
 
         uint256 delta = cumulativeAmount - job.settledAmount;
         bytes memory data = abi.encode(msg.sender, delta, optParams);
-        _beforeHook(job.hook, jobId, this.settle.selector, data);
+        _beforeHook(job.hook, jobId, msg.sig, data);
 
         job.settledAmount = cumulativeAmount;
         uint256 platformFee = (delta * platformFeeBP) / 10000;
@@ -559,6 +559,6 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
 
         emit Settled(jobId, cumulativeAmount, delta);
 
-        _afterHook(job.hook, jobId, this.settle.selector, data);
+        _afterHook(job.hook, jobId, msg.sig, data);
     }
 }
