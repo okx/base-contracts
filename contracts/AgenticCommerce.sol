@@ -10,6 +10,8 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "./IERC8183Hook.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 
 /**
  * @title AgenticCommerce
@@ -23,7 +25,7 @@ import "@openzeppelin/contracts/utils/introspection/ERC165Checker.sol";
  *
  *      When hook == address(0), the contract operates as a standalone job escrow.
  */
-contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyGuardTransient, UUPSUpgradeable {
+contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyGuardTransient, UUPSUpgradeable, EIP712Upgradeable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
@@ -44,6 +46,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
         address evaluator;
         string description;
         uint256 budget;
+        uint256 settledAmount;
         uint256 expiredAt;
         JobStatus status;
         address hook;
@@ -113,6 +116,11 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
         address indexed client,
         uint256 amount
     );
+    event Settled(
+        uint256 indexed jobId,
+        uint256 cumulativeAmount,
+        uint256 delta
+    );
     event HookWhitelistUpdated(address indexed hook, bool status);
     event PlatformFeeSet(uint256 feeBP, address indexed treasury);
     event EvaluatorFeeSet(uint256 feeBP);
@@ -130,6 +138,9 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
     error BudgetMismatch();
     error ProviderCannotBeEvaluator();
     error GracePeriodActive();
+    error InvalidVoucherSignature();
+    error NoNewSettlement();
+    error ExceedsBudget();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -141,6 +152,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
             revert ZeroAddress();
 
         __AccessControl_init();
+        __EIP712_init("AgenticCommerce", "1");
 
         platformTreasury = treasury_;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -237,6 +249,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
             evaluator: evaluator,
             description: description,
             budget: 0,
+            settledAmount: 0,
             expiredAt: expiredAt,
             status: JobStatus.Open,
             hook: hook,
@@ -366,7 +379,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
 
         job.status = JobStatus.Completed;
 
-        uint256 amount = job.budget;
+        uint256 amount = job.budget - job.settledAmount;
         uint256 platformFee = (amount * platformFeeBP) / 10000;
         uint256 evalFee = (amount * evaluatorFeeBP) / 10000;
         uint256 net = amount - platformFee - evalFee;
@@ -414,12 +427,13 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
         JobStatus prev = job.status;
         job.status = JobStatus.Rejected;
 
+        uint256 refundAmount = job.budget - job.settledAmount;
         if (
             (prev == JobStatus.Funded || prev == JobStatus.Submitted) &&
-            job.budget > 0
+            refundAmount > 0
         ) {
-            IERC20(job.paymentToken).safeTransfer(job.client, job.budget);
-            emit Refunded(jobId, job.client, job.budget);
+            IERC20(job.paymentToken).safeTransfer(job.client, refundAmount);
+            emit Refunded(jobId, job.client, refundAmount);
         }
 
         emit JobRejected(jobId, msg.sender, reason);
@@ -440,9 +454,10 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
 
         job.status = JobStatus.Expired;
 
-        if (job.budget > 0) {
-            IERC20(job.paymentToken).safeTransfer(job.client, job.budget);
-            emit Refunded(jobId, job.client, job.budget);
+        uint256 refundAmount = job.budget - job.settledAmount;
+        if (refundAmount > 0) {
+            IERC20(job.paymentToken).safeTransfer(job.client, refundAmount);
+            emit Refunded(jobId, job.client, refundAmount);
         }
 
         emit JobExpired(jobId);
@@ -452,5 +467,98 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
 
     function getJob(uint256 jobId) external view returns (Job memory) {
         return jobs[jobId];
+    }
+
+    // ═══════════════ Partial Settlement ═══════════════
+
+    /// @notice EIP-712 type hash for Voucher struct
+    /// @dev chainId and verifyingContract are already bound by the EIP-712 domain separator
+    bytes32 public constant VOUCHER_TYPEHASH =
+        keccak256(
+            "Voucher(uint256 jobId,uint256 cumulativeAmount,bytes optParams)"
+        );
+
+    function _verifyVoucher(
+        uint256 jobId,
+        uint256 cumulativeAmount,
+        address expectedSigner,
+        bytes calldata optParams,
+        bytes calldata sig
+    ) internal view {
+        // client signs over optParams, to bind actions for partial settlement
+        bytes32 structHash = keccak256(
+            abi.encode(
+                VOUCHER_TYPEHASH,
+                jobId,
+                cumulativeAmount,
+                keccak256(optParams)
+            )
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (
+            !SignatureChecker.isValidSignatureNowCalldata(
+                expectedSigner,
+                digest,
+                sig
+            )
+        ) revert InvalidVoucherSignature();
+    }
+
+    /// @notice Voucher settlement (Provider only)
+    /// @dev Verifies EIP-712 Voucher signature and releases only the new delta.
+    ///      Incremental only — does not close the job.
+    /// @param jobId The job to settle
+    /// @param cumulativeAmount Monotonically increasing cumulative settled amount
+    /// @param voucherSig EIP-712 Voucher signature from client
+    function settle(
+        uint256 jobId,
+        uint256 cumulativeAmount,
+        bytes calldata voucherSig,
+        bytes calldata optParams
+    ) external nonReentrant {
+        Job storage job = jobs[jobId];
+        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
+        if (msg.sender != job.provider) revert Unauthorized();
+        if (
+            job.status != JobStatus.Funded && job.status != JobStatus.Submitted
+        ) revert WrongStatus();
+        if (block.timestamp >= job.expiredAt) revert WrongStatus();
+        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
+        if (cumulativeAmount > job.budget) revert ExceedsBudget();
+
+        _verifyVoucher(
+            jobId,
+            cumulativeAmount,
+            job.client,
+            optParams,
+            voucherSig
+        );
+
+        uint256 delta = cumulativeAmount - job.settledAmount;
+        bytes memory data = abi.encode(msg.sender, delta, optParams);
+        _beforeHook(job.hook, jobId, this.settle.selector, data);
+
+        job.settledAmount = cumulativeAmount;
+        uint256 platformFee = (delta * platformFeeBP) / 10000;
+        uint256 evalFee = (delta * evaluatorFeeBP) / 10000;
+        uint256 net = delta - platformFee - evalFee;
+
+        IERC20 token = IERC20(job.paymentToken);
+        if (platformFee > 0) {
+            token.safeTransfer(platformTreasury, platformFee);
+            emit PlatformFeePaid(jobId, platformTreasury, platformFee);
+        }
+        if (evalFee > 0) {
+            token.safeTransfer(job.evaluator, evalFee);
+            emit EvaluatorFeePaid(jobId, job.evaluator, evalFee);
+        }
+        if (net > 0) {
+            token.safeTransfer(job.provider, net);
+        }
+        emit PaymentReleased(jobId, job.provider, net);
+
+        emit Settled(jobId, cumulativeAmount, delta);
+
+        _afterHook(job.hook, jobId, this.settle.selector, data);
     }
 }
