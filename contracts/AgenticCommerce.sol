@@ -29,6 +29,8 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
     using SafeERC20 for IERC20;
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    string public constant EIP712_NAME = "AgenticCommerce";
+    string public constant EIP712_VERSION = "1";
 
     enum JobStatus {
         Open,
@@ -152,7 +154,7 @@ contract AgenticCommerce is Initializable, AccessControlUpgradeable, ReentrancyG
             revert ZeroAddress();
 
         __AccessControl_init();
-        __EIP712_init("AgenticCommerce", "1");
+        __EIP712_init(EIP712_NAME, EIP712_VERSION);
 
         platformTreasury = treasury_;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);

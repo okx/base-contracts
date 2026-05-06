@@ -2,7 +2,7 @@
 
 ## Overview
 
-The hook system allows external contracts to intercept and extend ERC-8183 state transitions without modifying the core contract. Each job can optionally attach a hook contract that receives `beforeAction`/`afterAction` callbacks on every state transition.
+The hook system allows external contracts to intercept and extend ERC-8183 state transitions and settlement actions without modifying the core contract. Each job can optionally attach a hook contract that receives `beforeAction`/`afterAction` callbacks on hookable functions.
 
 The interface is intentionally minimal (two functions) so it remains stable as the protocol evolves — new hookable functions simply produce new selector values without changing the interface.
 
@@ -28,11 +28,12 @@ As produced by `AgenticCommerce`:
 | Selector | Data encoding | Notes |
 |----------|--------------|-------|
 | createJob | `abi.encode(client, provider, evaluator)` | afterAction only |
-| setBudget | `abi.encode(caller, amount, optParams)` | before + after |
+| setBudget | `abi.encode(caller, token, amount, optParams)` | before + after |
 | fund | `abi.encode(caller, optParams)` | before + after |
 | submit | `abi.encode(caller, deliverable, optParams)` | before + after |
 | complete | `abi.encode(caller, reason, optParams)` | before + after |
 | reject | `abi.encode(caller, reason, optParams)` | before + after |
+| settle | `abi.encode(caller, delta, optParams)` | before + after |
 
 All data includes `address caller` so the hook knows who initiated the transition.
 
@@ -76,13 +77,13 @@ function _afterHook(address hook, uint256 jobId, bytes4 selector, bytes memory d
 Each hookable function follows the same pattern:
 
 ```solidity
-function fund(uint256 jobId, bytes calldata optParams) external nonReentrant {
+function fund(uint256 jobId, uint256 expectedBudget, bytes calldata optParams) external nonReentrant {
     Job storage job = jobs[jobId];
     // ... validation ...
     bytes memory data = abi.encode(msg.sender, optParams);
     _beforeHook(job.hook, jobId, msg.sig, data);   // CAN revert to gate the transition
     job.status = JobStatus.Funded;
-    paymentToken.safeTransferFrom(job.client, address(this), job.budget);
+    IERC20(job.paymentToken).safeTransferFrom(job.client, address(this), job.budget);
     emit JobFunded(jobId, job.client, job.budget);
     _afterHook(job.hook, jobId, msg.sig, data);    // for bookkeeping / side effects
 }
@@ -91,6 +92,7 @@ function fund(uint256 jobId, bytes calldata optParams) external nonReentrant {
 ### Special cases
 
 - **createJob** — `afterAction` only (no `beforeAction`).
+- **setProvider** — NOT hookable.
 - **claimRefund** — NOT hookable (no `beforeAction`, no `afterAction`). This is a deliberate safety mechanism so hooks cannot block or interfere with expiry refunds.
 
 ## Hook Safety
