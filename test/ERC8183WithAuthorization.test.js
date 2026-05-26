@@ -97,8 +97,9 @@ describe("ERC8183WithAuthorization", function () {
     return signerWallet.signTypedData(domain, { [typeName]: types[typeName] }, value);
   }
 
-  function nonce(value) {
-    return ethers.zeroPadValue(ethers.toBeHex(value), 32);
+  function packedNonce(signer, value) {
+    const nonceValue = ethers.zeroPadValue(ethers.toBeHex(value), 12);
+    return ethers.concat([signer, nonceValue]);
   }
 
   function hashBytes(value) {
@@ -139,7 +140,7 @@ describe("ERC8183WithAuthorization", function () {
         descriptionHash: hashString(description),
         hook,
         providerAgentId: 0,
-        nonce: nonce(1),
+        nonce: packedNonce(client.address, 1),
         deadline,
       },
     );
@@ -147,11 +148,11 @@ describe("ERC8183WithAuthorization", function () {
     await expect(
       core.connect(relayer).createJobWithAuthorization(createParams, {
         signer: client.address,
-        nonce: nonce(1),
+        nonce: packedNonce(client.address, 1),
         deadline,
         sig: createSig,
       }),
-    ).to.emit(core, "AuthorizationUsed").withArgs(client.address, nonce(1));
+    ).to.emit(core, "AuthorizationUsed").withArgs(client.address, packedNonce(client.address, 1));
 
     const jobId = 1n;
     expect((await core.getJob(jobId)).client).to.equal(client.address);
@@ -166,13 +167,13 @@ describe("ERC8183WithAuthorization", function () {
         token: usdcAddr,
         amount: TWENTY_USDC,
         optParamsHash: hashBytes(optParams),
-        nonce: nonce(2),
+        nonce: packedNonce(provider.address, 2),
         deadline,
       },
     );
     await core.connect(relayer).setBudgetWithAuthorization(jobId, usdcAddr, TWENTY_USDC, optParams, {
       signer: provider.address,
-      nonce: nonce(2),
+      nonce: packedNonce(provider.address, 2),
       deadline,
       sig: setBudgetSig,
     });
@@ -182,12 +183,12 @@ describe("ERC8183WithAuthorization", function () {
       jobId,
       expectedBudget: TWENTY_USDC,
       optParamsHash: hashBytes(optParams),
-      nonce: nonce(3),
+      nonce: packedNonce(client.address, 3),
       deadline,
     });
     await core.connect(relayer).fundWithAuthorization(jobId, TWENTY_USDC, optParams, {
       signer: client.address,
-      nonce: nonce(3),
+      nonce: packedNonce(client.address, 3),
       deadline,
       sig: fundSig,
     });
@@ -198,12 +199,12 @@ describe("ERC8183WithAuthorization", function () {
       jobId,
       deliverable,
       optParamsHash: hashBytes(optParams),
-      nonce: nonce(4),
+      nonce: packedNonce(provider.address, 4),
       deadline,
     });
     await core.connect(relayer).submitWithAuthorization(jobId, deliverable, optParams, {
       signer: provider.address,
-      nonce: nonce(4),
+      nonce: packedNonce(provider.address, 4),
       deadline,
       sig: submitSig,
     });
@@ -214,12 +215,12 @@ describe("ERC8183WithAuthorization", function () {
       jobId,
       reason,
       optParamsHash: hashBytes(optParams),
-      nonce: nonce(5),
+      nonce: packedNonce(evaluator.address, 5),
       deadline,
     });
     await core.connect(relayer).completeWithAuthorization(jobId, reason, optParams, {
       signer: evaluator.address,
-      nonce: nonce(5),
+      nonce: packedNonce(evaluator.address, 5),
       deadline,
       sig: completeSig,
     });
@@ -233,7 +234,7 @@ describe("ERC8183WithAuthorization", function () {
     const expiry = (await time.latest()) + 3600;
     const deadline = (await time.latest()) + 7200;
     const description = "replay test";
-    const authNonce = nonce(11);
+    const authNonce = packedNonce(client.address, 11);
     const params = {
       provider: provider.address,
       evaluator: evaluator.address,
@@ -261,11 +262,12 @@ describe("ERC8183WithAuthorization", function () {
     const auth = { signer: client.address, nonce: authNonce, deadline, sig };
 
     await core.connect(relayer).createJobWithAuthorization(params, auth);
+    expect(await core.authorizationNonceUsed(authNonce)).to.equal(true);
     await expect(core.connect(relayer).createJobWithAuthorization(params, auth))
       .to.be.revertedWithCustomError(core, "AuthorizationNonceUsed");
 
     const expiredDeadline = (await time.latest()) - 1;
-    const expiredNonce = nonce(12);
+    const expiredNonce = packedNonce(client.address, 12);
     const expiredSig = await signAuthorization(
       core,
       client,
@@ -289,7 +291,7 @@ describe("ERC8183WithAuthorization", function () {
       ),
     ).to.be.revertedWithCustomError(core, "AuthorizationExpired");
 
-    const tamperedNonce = nonce(13);
+    const tamperedNonce = packedNonce(client.address, 13);
     const tamperedSig = await signAuthorization(
       core,
       client,
@@ -312,5 +314,44 @@ describe("ERC8183WithAuthorization", function () {
         { signer: client.address, nonce: tamperedNonce, deadline, sig: tamperedSig },
       ),
     ).to.be.revertedWithCustomError(core, "InvalidAuthorizationSignature");
+  });
+
+  it("rejects authorizations whose packed nonce address does not match the signer", async function () {
+    const { core, client, provider, evaluator, relayer } = await loadFixture(deployFixture);
+    const expiry = (await time.latest()) + 3600;
+    const deadline = (await time.latest()) + 7200;
+    const description = "nonce signer mismatch";
+    const authNonce = packedNonce(provider.address, 21);
+    const params = {
+      provider: provider.address,
+      evaluator: evaluator.address,
+      expiredAt: expiry,
+      description,
+      hook: ethers.ZeroAddress,
+      providerAgentId: 0,
+    };
+    const sig = await signAuthorization(
+      core,
+      client,
+      "CreateJobAuthorization",
+      {
+        signer: client.address,
+        provider: provider.address,
+        evaluator: evaluator.address,
+        expiredAt: expiry,
+        descriptionHash: hashString(description),
+        hook: ethers.ZeroAddress,
+        providerAgentId: 0,
+        nonce: authNonce,
+        deadline,
+      },
+    );
+
+    await expect(
+      core.connect(relayer).createJobWithAuthorization(
+        params,
+        { signer: client.address, nonce: authNonce, deadline, sig },
+      ),
+    ).to.be.revertedWithCustomError(core, "InvalidAuthorizationNonce");
   });
 });

@@ -30,7 +30,8 @@ contract ERC8183WithAuthorization is ERC8183, EIP712Upgradeable {
         "RejectAuthorization(address signer,uint256 jobId,bytes32 reason,bytes32 optParamsHash,bytes32 nonce,uint256 deadline)"
     );
 
-    mapping(address => mapping(bytes32 => bool)) public authorizationNonceUsed;
+    /// @notice Tracks used packed nonces: bytes20(signer) || bytes12(nonce).
+    mapping(bytes32 => bool) public authorizationNonceUsed;
 
     struct Authorization {
         address signer;
@@ -51,6 +52,7 @@ contract ERC8183WithAuthorization is ERC8183, EIP712Upgradeable {
     event AuthorizationUsed(address indexed signer, bytes32 indexed nonce);
 
     error AuthorizationExpired();
+    error InvalidAuthorizationNonce();
     error AuthorizationNonceUsed();
     error InvalidAuthorizationSignature();
 
@@ -223,11 +225,16 @@ contract ERC8183WithAuthorization is ERC8183, EIP712Upgradeable {
         bytes32 structHash,
         bytes calldata sig
     ) internal {
+        if (_packedNonceSigner(nonce) != signer) revert InvalidAuthorizationNonce();
         if (block.timestamp > deadline) revert AuthorizationExpired();
-        if (authorizationNonceUsed[signer][nonce]) revert AuthorizationNonceUsed();
+        if (authorizationNonceUsed[nonce]) revert AuthorizationNonceUsed();
         bytes32 digest = _hashTypedDataV4(structHash);
         if (!SignatureChecker.isValidSignatureNowCalldata(signer, digest, sig)) revert InvalidAuthorizationSignature();
-        authorizationNonceUsed[signer][nonce] = true;
+        authorizationNonceUsed[nonce] = true;
         emit AuthorizationUsed(signer, nonce);
+    }
+
+    function _packedNonceSigner(bytes32 nonce) internal pure returns (address) {
+        return address(uint160(uint256(nonce) >> 96));
     }
 }
