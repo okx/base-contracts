@@ -69,6 +69,7 @@ Each job SHALL have at least:
 - `status` (Open | Funded | Submitted | Completed | Rejected | Expired)
 - `paymentToken` (address) — the [ERC-20](./eip-20.md) token used for payment on this job, set via `setBudget`.
 - `hook` (address) — OPTIONAL. External hook contract called before and after core functions (see Hooks below). MAY be `address(0)` (no hook).
+- `payoutReceiver` (address) — OPTIONAL. Provider-side payout recipient. MAY be `address(0)` to pay the provider directly.
 - `providerAgentId` (uint256) — OPTIONAL. When non-zero, references an agent identity in an [ERC-8004](./eip-8004.md) registry, enabling on-chain identity binding for reputation. Set via `setProvider` (or at creation if provider is known). Default `0` (unset).
 
 Each job has its own [ERC-20](./eip-20.md) payment token. The token address is set alongside the amount when `setBudget` is called. This allows different jobs on the same contract to use different tokens.
@@ -84,8 +85,8 @@ SHALL revert if `job.provider == address(0)` (provider MUST be set before fundin
 
 ### Core Functions
 
-- **createJob(provider, evaluator, expiredAt, description, hook?, providerAgentId?)**
-Called by client. Creates job in Open with `client = msg.sender`, `provider`, `evaluator`, `expiredAt`, `description`, and optional `hook` address. SHALL revert if `evaluator` is zero, if `expiredAt` is not at least 5 minutes in the future, if `provider == evaluator`, or if `msg.sender == provider`. **Provider MAY be zero**; if so, client MUST call `setProvider` before `fund`. `hook` MAY be `address(0)` (no hook); if non-zero, the hook MUST be admin-whitelisted and SHOULD advertise support for the `IERC8183Hook` interface via ERC-165. `providerAgentId` is the provider's [ERC-8004](./eip-8004.md) agent identity; if `provider` is non-zero and `providerAgentId` is non-zero, SHALL set `job.providerAgentId = providerAgentId`; the contract MAY verify that `provider` is the owner or operator of that `providerAgentId` on the ERC-8004 registry. Returns `jobId`.
+- **createJob(provider, evaluator, expiredAt, description, hook?, payoutReceiver?, providerAgentId?)**
+Called by client. Creates job in Open with `client = msg.sender`, `provider`, `evaluator`, `expiredAt`, `description`, optional `hook` address, and optional `payoutReceiver`. SHALL revert if `evaluator` is zero, if `expiredAt` is not at least 5 minutes in the future, if `provider == evaluator`, or if `msg.sender == provider`. **Provider MAY be zero**; if so, client MUST call `setProvider` before `fund`. `hook` MAY be `address(0)` (no hook); if non-zero, the hook MUST be admin-whitelisted and SHOULD advertise support for the `IERC8183Hook` interface via ERC-165. `payoutReceiver` MAY be `address(0)` to pay the provider directly. `providerAgentId` is the provider's [ERC-8004](./eip-8004.md) agent identity; if `provider` is non-zero and `providerAgentId` is non-zero, SHALL set `job.providerAgentId = providerAgentId`; the contract MAY verify that `provider` is the owner or operator of that `providerAgentId` on the ERC-8004 registry. Returns `jobId`.
 - **setProvider(jobId, provider, agentId?)**
 Called by client. SHALL revert if job is not Open, has expired, current `job.provider != address(0)`, `provider == address(0)`, or `provider == job.evaluator`. SHALL set `job.provider = provider`. `agentId` is the provider's [ERC-8004](./eip-8004.md) agent identity; if non-zero, SHALL set `job.providerAgentId = agentId`; the contract MAY verify that `provider` is the owner or operator of that agentId on the ERC-8004 registry.
 - **setBudget(jobId, token, amount, optParams?)**
@@ -198,7 +199,7 @@ Implementations MAY provide a `BaseERC8183Hook` that routes the generic `beforeA
 
 ```
 Step 1 — createJob
-  Client → createJob(provider, evaluator, expiredAt, desc, hook=FundTransferHook)
+  Client → createJob(provider, evaluator, expiredAt, desc, hook=FundTransferHook, payoutReceiver=address(0))
   Job created (Open), hook address stored.
 
 Step 2 — setBudget
@@ -246,7 +247,7 @@ Zero direct calls to the hook. All interactions flow through the core contract �
 
 ```
 Step 1 — createJob
-  Client → createJob(provider=0, evaluator, expiredAt, desc, hook=BiddingHook)
+  Client → createJob(provider=0, evaluator, expiredAt, desc, hook=BiddingHook, payoutReceiver=address(0))
   Job created (Open), provider = address(0).
 
 Step 2 — setBudget (opens bidding via hook callback)
@@ -448,6 +449,7 @@ contract ERC8183 is
         address paymentToken;
         uint256 providerAgentId;
         string description;
+        address payoutReceiver;
     }
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
@@ -467,6 +469,7 @@ contract ERC8183 is
     event BudgetSet(uint256 indexed jobId, address indexed token, uint256 amount);
     event JobFunded(uint256 indexed jobId, address indexed client, uint256 amount);
     event JobSubmitted(uint256 indexed jobId, address indexed provider, bytes32 deliverable);
+    event PayoutReceiverSet(uint256 indexed jobId, address indexed payoutReceiver);
     event JobCompleted(uint256 indexed jobId, address indexed evaluator, bytes32 reason);
     event JobRejected(uint256 indexed jobId, address indexed rejector, bytes32 reason);
     event JobExpired(uint256 indexed jobId);
@@ -584,6 +587,7 @@ contract ERC8183 is
         uint48 expiredAt,
         string calldata description,
         address hook,
+        address payoutReceiver,
         uint256 providerAgentId
     ) external whenNotPaused nonReentrant returns (uint256) {
         if (expiredAt <= block.timestamp + 5 minutes) revert ExpiryTooShort();
@@ -607,10 +611,12 @@ contract ERC8183 is
             hook: hook,
             paymentToken: address(0),
             providerAgentId: provider != address(0) ? providerAgentId : 0,
-            description: description
+            description: description,
+            payoutReceiver: payoutReceiver
         });
 
         emit JobCreated(jobId, msg.sender, provider, evaluator, expiredAt, hook);
+        if (payoutReceiver != address(0)) emit PayoutReceiverSet(jobId, payoutReceiver);
         return jobId;
     }
 

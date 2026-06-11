@@ -12,7 +12,7 @@ sequenceDiagram
     participant E as Evaluator
 
     Note over C,E: -- Job Creation --
-    C->>Core: createJob(provider, evaluator, expiry,<br/>"Generate landscape wallpaper", address(0), 0)
+    C->>Core: createJob(provider, evaluator, expiry,<br/>"Generate landscape wallpaper", address(0), address(0), 0)
     Note over Core: Status: Open (no hook)
 
     Note over C,E: -- Budget --

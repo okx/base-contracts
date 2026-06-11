@@ -8,7 +8,10 @@ import "./ERC8183.sol";
 /// @notice Adds EIP-712 signed authorization entrypoints to ERC8183.
 contract ERC8183WithAuthorization is ERC8183 {
     bytes32 public constant CREATE_JOB_AUTHORIZATION_TYPEHASH = keccak256(
-        "CreateJobAuthorization(address signer,address provider,address evaluator,uint48 expiredAt,bytes32 descriptionHash,address hook,uint256 providerAgentId,uint72 nonce,uint256 deadline)"
+        "CreateJobAuthorization(address signer,address provider,address evaluator,uint48 expiredAt,bytes32 descriptionHash,address hook,address payoutReceiver,uint256 providerAgentId,uint72 nonce,uint256 deadline)"
+    );
+    bytes32 public constant SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH = keccak256(
+        "SetPayoutReceiverAuthorization(address signer,uint256 jobId,address payoutReceiver,uint72 nonce,uint256 deadline)"
     );
     bytes32 public constant SET_PROVIDER_AUTHORIZATION_TYPEHASH = keccak256(
         "SetProviderAuthorization(address signer,uint256 jobId,address provider,uint256 agentId,uint72 nonce,uint256 deadline)"
@@ -57,6 +60,7 @@ contract ERC8183WithAuthorization is ERC8183 {
         uint48 expiredAt;
         string description;
         address hook;
+        address payoutReceiver;
         uint256 providerAgentId;
     }
 
@@ -108,6 +112,7 @@ contract ERC8183WithAuthorization is ERC8183 {
                     params.expiredAt,
                     keccak256(bytes(params.description)),
                     params.hook,
+                    params.payoutReceiver,
                     params.providerAgentId,
                     auth.nonce,
                     auth.deadline
@@ -122,8 +127,33 @@ contract ERC8183WithAuthorization is ERC8183 {
             params.expiredAt,
             params.description,
             params.hook,
+            params.payoutReceiver,
             params.providerAgentId
         );
+    }
+
+    function setPayoutReceiverWithAuthorization(
+        uint256 jobId,
+        address payoutReceiver,
+        Authorization calldata auth
+    ) external whenNotPaused nonReentrant {
+        _verifyAuthorization(
+            auth.signer,
+            auth.nonce,
+            auth.deadline,
+            keccak256(
+                abi.encode(
+                    SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH,
+                    auth.signer,
+                    jobId,
+                    payoutReceiver,
+                    auth.nonce,
+                    auth.deadline
+                )
+            ),
+            auth.sig
+        );
+        _setPayoutReceiver(auth.signer, jobId, payoutReceiver);
     }
 
     function setProviderWithAuthorization(

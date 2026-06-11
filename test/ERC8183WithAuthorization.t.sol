@@ -17,7 +17,10 @@ contract ERC8183WithAuthorizationTest is Test {
     bytes32 constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
     bytes32 constant CREATE_JOB_AUTHORIZATION_TYPEHASH = keccak256(
-        "CreateJobAuthorization(address signer,address provider,address evaluator,uint48 expiredAt,bytes32 descriptionHash,address hook,uint256 providerAgentId,uint72 nonce,uint256 deadline)"
+        "CreateJobAuthorization(address signer,address provider,address evaluator,uint48 expiredAt,bytes32 descriptionHash,address hook,address payoutReceiver,uint256 providerAgentId,uint72 nonce,uint256 deadline)"
+    );
+    bytes32 constant SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH = keccak256(
+        "SetPayoutReceiverAuthorization(address signer,uint256 jobId,address payoutReceiver,uint72 nonce,uint256 deadline)"
     );
     bytes32 constant SET_PROVIDER_AUTHORIZATION_TYPEHASH = keccak256(
         "SetProviderAuthorization(address signer,uint256 jobId,address provider,uint256 agentId,uint72 nonce,uint256 deadline)"
@@ -63,6 +66,7 @@ contract ERC8183WithAuthorizationTest is Test {
     address relayer = makeAddr("relayer");
 
     event AuthorizationUsed(address indexed signer, bytes32 indexed nonce);
+    event PayoutReceiverSet(uint256 indexed jobId, address indexed payoutReceiver);
     event ClaimSubmitted(
         uint256 indexed jobId, address indexed provider, uint256 cumulativeAmount, uint256 delta, bytes32 deliverable
     );
@@ -164,6 +168,7 @@ contract ERC8183WithAuthorizationTest is Test {
         uint48 expiredAt,
         string memory description,
         address hook,
+        address payoutReceiver,
         uint256 providerAgentId
     ) internal pure returns (ERC8183WithAuthorization.CreateJobAuthorizationParams memory) {
         return ERC8183WithAuthorization.CreateJobAuthorizationParams({
@@ -172,6 +177,7 @@ contract ERC8183WithAuthorizationTest is Test {
                 expiredAt: expiredAt,
                 description: description,
                 hook: hook,
+                payoutReceiver: payoutReceiver,
                 providerAgentId: providerAgentId
             });
     }
@@ -184,6 +190,7 @@ contract ERC8183WithAuthorizationTest is Test {
         uint48 expiredAt,
         string memory description,
         address hook,
+        address payoutReceiver,
         uint256 providerAgentId,
         uint72 nonce,
         uint256 deadline
@@ -199,10 +206,27 @@ contract ERC8183WithAuthorizationTest is Test {
                     expiredAt,
                     _hashString(description),
                     hook,
+                    payoutReceiver,
                     providerAgentId,
                     nonce,
                     deadline
                 )
+            )
+        );
+    }
+
+    function _signSetPayoutReceiver(
+        uint256 signerPk,
+        address signer,
+        uint256 jobId,
+        address payoutReceiver,
+        uint72 nonce,
+        uint256 deadline
+    ) internal view returns (bytes memory) {
+        return _sign(
+            signerPk,
+            keccak256(
+                abi.encode(SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH, signer, jobId, payoutReceiver, nonce, deadline)
             )
         );
     }
@@ -445,7 +469,7 @@ contract ERC8183WithAuthorizationTest is Test {
 
     function _createFundedJob() internal returns (uint256 jobId) {
         vm.prank(client);
-        jobId = core.createJob(provider, evaluator, _futureExpiry(), "claim auth job", address(0), 0);
+        jobId = core.createJob(provider, evaluator, _futureExpiry(), "claim auth job", address(0), address(0), 0);
         vm.prank(provider);
         core.setBudget(jobId, address(usdc), TWENTY_USDC, "");
         vm.prank(client);
@@ -463,11 +487,11 @@ contract ERC8183WithAuthorizationTest is Test {
         uint256 deadline
     ) internal returns (uint256 jobId) {
         bytes memory sig = _signCreateJob(
-            signerPk, signer, provider_, evaluator_, expiry, description, address(0), 0, nonce, deadline
+            signerPk, signer, provider_, evaluator_, expiry, description, address(0), address(0), 0, nonce, deadline
         );
         vm.prank(relayer);
         jobId = core.createJobWithAuthorization(
-            _createParams(provider_, evaluator_, expiry, description, address(0), 0),
+            _createParams(provider_, evaluator_, expiry, description, address(0), address(0), 0),
             _auth(signer, nonce, deadline, sig)
         );
     }
@@ -561,9 +585,70 @@ contract ERC8183WithAuthorizationTest is Test {
         assertEq(usdc.balanceOf(provider), TWENTY_USDC);
     }
 
+    function test_createJobWithAuthorizationStoresPayoutReceiver() public {
+        uint48 expiry = _futureExpiry();
+        uint256 deadline = _deadline();
+        string memory description = "authorization receiver job";
+        address payoutReceiver = makeAddr("authorizedPayoutReceiver");
+        uint72 nonce = 6;
+
+        assertEq(core.CREATE_JOB_AUTHORIZATION_TYPEHASH(), CREATE_JOB_AUTHORIZATION_TYPEHASH);
+
+        bytes memory sig = _signCreateJob(
+            clientPk, client, provider, evaluator, expiry, description, address(0), payoutReceiver, 0, nonce, deadline
+        );
+
+        vm.expectEmit(true, true, true, true, address(core));
+        emit AuthorizationUsed(client, _packNonce(client, nonce));
+        vm.expectEmit(true, true, true, true, address(core));
+        emit PayoutReceiverSet(1, payoutReceiver);
+        vm.prank(relayer);
+        uint256 jobId = core.createJobWithAuthorization(
+            _createParams(provider, evaluator, expiry, description, address(0), payoutReceiver, 0),
+            _auth(client, nonce, deadline, sig)
+        );
+
+        ERC8183.Job memory job = core.getJob(jobId);
+        assertEq(job.client, client);
+        assertEq(job.payoutReceiver, payoutReceiver);
+    }
+
+    function test_setPayoutReceiverWithAuthorization_ClientOnlyOpenOnlyAndLocksAfterFund() public {
+        uint48 expiry = _futureExpiry();
+        uint256 deadline = _deadline();
+        uint256 jobId = _relayCreateJob(client, clientPk, provider, evaluator, expiry, "receiver auth job", 1, deadline);
+        address plainReceiver = makeAddr("plainReceiver");
+        address secondReceiver = makeAddr("secondReceiver");
+
+        assertEq(core.SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH(), SET_PAYOUT_RECEIVER_AUTHORIZATION_TYPEHASH);
+
+        bytes memory providerSig = _signSetPayoutReceiver(providerPk, provider, jobId, plainReceiver, 2, deadline);
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(relayer);
+        core.setPayoutReceiverWithAuthorization(jobId, plainReceiver, _auth(provider, 2, deadline, providerSig));
+
+        bytes memory clientSig = _signSetPayoutReceiver(clientPk, client, jobId, plainReceiver, 3, deadline);
+        vm.expectEmit(true, true, true, true, address(core));
+        emit AuthorizationUsed(client, _packNonce(client, 3));
+        vm.expectEmit(true, true, true, true, address(core));
+        emit PayoutReceiverSet(jobId, plainReceiver);
+        vm.prank(relayer);
+        core.setPayoutReceiverWithAuthorization(jobId, plainReceiver, _auth(client, 3, deadline, clientSig));
+
+        assertEq(core.getJob(jobId).payoutReceiver, plainReceiver);
+
+        _relaySetBudget(jobId, 4, deadline);
+        _relayFund(jobId, 5, deadline);
+
+        bytes memory lockedSig = _signSetPayoutReceiver(clientPk, client, jobId, secondReceiver, 6, deadline);
+        vm.expectRevert(ERC8183.WrongStatus.selector);
+        vm.prank(relayer);
+        core.setPayoutReceiverWithAuthorization(jobId, secondReceiver, _auth(client, 6, deadline, lockedSig));
+    }
+
     function test_relaysClientAuthorizedSetProvider() public {
         vm.prank(client);
-        uint256 jobId = core.createJob(address(0), evaluator, _futureExpiry(), "late provider", address(0), 0);
+        uint256 jobId = core.createJob(address(0), evaluator, _futureExpiry(), "late provider", address(0), address(0), 0);
         uint256 deadline = _deadline();
         uint256 agentId = 7;
         bytes memory sig = _signSetProvider(clientPk, client, jobId, provider, agentId, 61, deadline);
@@ -687,9 +772,9 @@ contract ERC8183WithAuthorizationTest is Test {
         string memory description = "replay test";
         uint72 authNonce = 11;
         ERC8183WithAuthorization.CreateJobAuthorizationParams memory params =
-            _createParams(provider, evaluator, expiry, description, address(0), 0);
+            _createParams(provider, evaluator, expiry, description, address(0), address(0), 0);
         bytes memory sig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, description, address(0), 0, authNonce, deadline
+            clientPk, client, provider, evaluator, expiry, description, address(0), address(0), 0, authNonce, deadline
         );
         ERC8183WithAuthorization.Authorization memory auth = _auth(client, authNonce, deadline, sig);
 
@@ -707,12 +792,22 @@ contract ERC8183WithAuthorizationTest is Test {
         uint256 expiredDeadline = block.timestamp - 1;
         uint72 expiredNonce = 12;
         bytes memory expiredSig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, "expired", address(0), 0, expiredNonce, expiredDeadline
+            clientPk,
+            client,
+            provider,
+            evaluator,
+            expiry,
+            "expired",
+            address(0),
+            address(0),
+            0,
+            expiredNonce,
+            expiredDeadline
         );
         vm.expectRevert(ERC8183WithAuthorization.AuthorizationExpired.selector);
         vm.prank(relayer);
         core.createJobWithAuthorization(
-            _createParams(provider, evaluator, expiry, "expired", address(0), 0),
+            _createParams(provider, evaluator, expiry, "expired", address(0), address(0), 0),
             _auth(client, expiredNonce, expiredDeadline, expiredSig)
         );
     }
@@ -722,12 +817,12 @@ contract ERC8183WithAuthorizationTest is Test {
         uint256 deadline = _deadline();
         uint72 tamperedNonce = 13;
         bytes memory tamperedSig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, "signed", address(0), 0, tamperedNonce, deadline
+            clientPk, client, provider, evaluator, expiry, "signed", address(0), address(0), 0, tamperedNonce, deadline
         );
         vm.expectRevert(ERC8183WithAuthorization.InvalidAuthorizationSignature.selector);
         vm.prank(relayer);
         core.createJobWithAuthorization(
-            _createParams(provider, evaluator, expiry, "tampered", address(0), 0),
+            _createParams(provider, evaluator, expiry, "tampered", address(0), address(0), 0),
             _auth(client, tamperedNonce, deadline, tamperedSig)
         );
         assertFalse(core.authorizationNonceUsed(_packNonce(client, tamperedNonce)));
@@ -742,7 +837,7 @@ contract ERC8183WithAuthorizationTest is Test {
         bytes32 packed = _packNonce(signer, nonce);
         string memory description = "erc1271 nonce reservation";
         ERC8183WithAuthorization.CreateJobAuthorizationParams memory params =
-            _createParams(provider, evaluator, expiry, description, address(0), 0);
+            _createParams(provider, evaluator, expiry, description, address(0), address(0), 0);
         bytes memory sig = abi.encode(address(core), packed);
 
         vm.expectEmit(true, true, true, true, address(core));
@@ -759,9 +854,9 @@ contract ERC8183WithAuthorizationTest is Test {
         uint256 deadline = _deadline();
         string memory description = "max nonce";
         ERC8183WithAuthorization.CreateJobAuthorizationParams memory params =
-            _createParams(provider, evaluator, expiry, description, address(0), 0);
+            _createParams(provider, evaluator, expiry, description, address(0), address(0), 0);
         bytes memory sig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, description, address(0), 0, MAX_UINT72, deadline
+            clientPk, client, provider, evaluator, expiry, description, address(0), address(0), 0, MAX_UINT72, deadline
         );
         bytes32 packed = _packNonce(client, MAX_UINT72);
 
@@ -779,9 +874,9 @@ contract ERC8183WithAuthorizationTest is Test {
         string memory description = "shared nonce";
         uint72 sharedNonce = 42;
         ERC8183WithAuthorization.CreateJobAuthorizationParams memory params =
-            _createParams(provider, evaluator, expiry, description, address(0), 0);
+            _createParams(provider, evaluator, expiry, description, address(0), address(0), 0);
         bytes memory createSig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, description, address(0), 0, sharedNonce, deadline
+            clientPk, client, provider, evaluator, expiry, description, address(0), address(0), 0, sharedNonce, deadline
         );
 
         vm.prank(relayer);
@@ -808,9 +903,9 @@ contract ERC8183WithAuthorizationTest is Test {
         uint72 nonce = 63;
         string memory description = "cancelled";
         ERC8183WithAuthorization.CreateJobAuthorizationParams memory params =
-            _createParams(provider, evaluator, expiry, description, address(0), 0);
+            _createParams(provider, evaluator, expiry, description, address(0), address(0), 0);
         bytes memory sig = _signCreateJob(
-            clientPk, client, provider, evaluator, expiry, description, address(0), 0, nonce, deadline
+            clientPk, client, provider, evaluator, expiry, description, address(0), address(0), 0, nonce, deadline
         );
 
         vm.expectEmit(true, true, true, true, address(core));
