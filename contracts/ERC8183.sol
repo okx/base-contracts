@@ -147,7 +147,7 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         address indexed provider,
         bytes32 deliverable
     );
-    /// @notice Emitted when a job is completed (by evaluator)
+    /// @notice Emitted when a job is completed (escrow fully released to the provider)
     event JobCompleted(
         uint256 indexed jobId,
         address indexed evaluator,
@@ -301,7 +301,7 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
     error EmptyDeliverable();
     /// @notice Thrown when submitting a provider claim or refunding while another claim is pending
     error PendingClaimExists();
-    /// @notice Thrown when approveClaim/rejectClaim is called with no matching pending claim
+    /// @notice Thrown when release (approve) or reject(claimHash) is called with no matching pending claim
     error NoPendingClaim();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -701,125 +701,246 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         _afterHook(job.hook, jobId, this.fund.selector, data);
     }
 
-    /// @notice Provider submits work. Transitions Funded -> Submitted (with evaluator)
-    /// @param jobId The job to submit work for
+    /// @notice Provider submits work against a job — the single generic provider entry
+    ///         point. The cumulative amount asserted determines the path:
+    ///         - cumulativeAmount == budget is a FINAL delivery: the job moves to
+    ///           Submitted for terminal evaluation (release / reject), and any pending
+    ///           milestone claim is superseded. A zero-budget job (cumulativeAmount == 0)
+    ///           takes this path.
+    ///         - cumulativeAmount < budget files a MILESTONE claim: a pending settlement
+    ///           the client or evaluator approves (`release`) or any party cancels via
+    ///           `reject` with the claim hash. The job stays Funded so further settlement
+    ///           can continue.
+    /// @param jobId The job to submit against
+    /// @param cumulativeAmount Cumulative amount asserted as due (must be <= budget)
     /// @param deliverable Hash or reference to the deliverable
     /// @param optParams Hook-specific parameters (passed to before/after hooks)
     function submit(
         uint256 jobId,
+        uint256 cumulativeAmount,
         bytes32 deliverable,
         bytes calldata optParams
     ) external whenNotPaused nonReentrant {
-        _submit(msg.sender, jobId, deliverable, optParams);
+        _submit(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
     }
 
     function _submit(
         address actor,
         uint256 jobId,
+        uint256 cumulativeAmount,
         bytes32 deliverable,
         bytes calldata optParams
     ) internal {
         Job storage job = jobs[jobId];
         if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
+        if (actor != job.provider) revert Unauthorized();
         if (
             job.status != JobStatus.Funded &&
             (job.status != JobStatus.Open || job.budget > 0) // Allow Open job with 0 budget to be submitted
         ) revert WrongStatus();
         if (job.expiredAt != 0 && block.timestamp >= job.expiredAt) revert WrongStatus();
-        if (actor != job.provider) revert Unauthorized();
+        if (cumulativeAmount > job.budget) revert ExceedsBudget();
 
-        bytes memory data = abi.encode(actor, deliverable, optParams);
-        if (pendingClaimHash[jobId] != bytes32(0)) {
-            // Final submit supersedes any pending milestone claim: the provider is
-            // moving to the normal completion path for the full remaining escrow,
-            // and submit hooks should observe that post-supersede claim state.
-            delete pendingClaimHash[jobId];
-            emit ClaimRejected(jobId, actor, bytes32("superseded-by-submit"));
+        if (cumulativeAmount == job.budget) {
+            // FINAL delivery: assert the full escrow for terminal evaluation.
+            uint256 delta = cumulativeAmount - job.settledAmount;
+            bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
+            if (pendingClaimHash[jobId] != bytes32(0)) {
+                // Final submit supersedes any pending milestone claim: the provider is
+                // moving to the normal completion path for the full remaining escrow.
+                delete pendingClaimHash[jobId];
+                emit ClaimRejected(jobId, actor, bytes32("superseded-by-submit"));
+            }
+            _beforeHook(job.hook, jobId, this.submit.selector, data);
+
+            job.status = JobStatus.Submitted;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            job.submittedAt = uint48(block.timestamp);
+            emit JobSubmitted(jobId, actor, deliverable);
+
+            _afterHook(job.hook, jobId, this.submit.selector, data);
+        } else {
+            // MILESTONE claim: a pending settlement for part of the budget.
+            if (job.status != JobStatus.Funded) revert WrongStatus();
+            if (deliverable == bytes32(0)) revert EmptyDeliverable();
+            if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
+            if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
+
+            uint256 delta = cumulativeAmount - job.settledAmount;
+            bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
+            _beforeHook(job.hook, jobId, this.submit.selector, data);
+
+            bytes32 claimHash = _claimHash(cumulativeAmount, deliverable, keccak256(optParams));
+            if (submittedClaimHash[jobId][claimHash]) revert ClaimAlreadySubmitted();
+            submittedClaimHash[jobId][claimHash] = true;
+            pendingClaimHash[jobId] = claimHash;
+
+            emit ClaimSubmitted(jobId, actor, cumulativeAmount, delta, deliverable, optParams);
+            _afterHook(job.hook, jobId, this.submit.selector, data);
         }
-        _beforeHook(job.hook, jobId, this.submit.selector, data);
-
-        job.status = JobStatus.Submitted;
-        // forge-lint: disable-next-line(unsafe-typecast)
-        job.submittedAt = uint48(block.timestamp);
-        emit JobSubmitted(jobId, actor, deliverable);
-
-        _afterHook(job.hook, jobId, this.submit.selector, data);
     }
 
-    /// @notice Evaluator approves the submission. Transitions Submitted -> Completed.
-    ///         Distributes escrowed funds: platform fee, evaluator fee, net to provider.
-    /// @param jobId The job to complete
-    /// @param reason Evaluator's attestation reason
+    /// @notice Client settles escrow directly to the provider — the fast path. CLIENT
+    ///         ONLY: the evaluator may resolve a provider assertion via `release`, but
+    ///         may never originate a payment on a bare Funded job (the client funded it,
+    ///         only the client may voluntarily pay out without a provider assertion).
+    ///         Valid only on a Funded job with NO pending claim — honour a standing claim
+    ///         via `release`/`reject` first. Draining the escrow completes the job.
+    /// @param jobId The job to settle against
+    /// @param cumulativeAmount Cumulative amount to settle to (must be <= budget)
+    /// @param deliverable Client's settlement attestation / memo
     /// @param optParams Hook-specific parameters (passed to before/after hooks)
-    function complete(
+    function settle(
         uint256 jobId,
-        bytes32 reason,
+        uint256 cumulativeAmount,
+        bytes32 deliverable,
         bytes calldata optParams
     ) external whenNotPaused nonReentrant {
-        _complete(msg.sender, jobId, reason, optParams);
+        _settle(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
     }
 
-    function _complete(
+    function _settle(
         address actor,
         uint256 jobId,
-        bytes32 reason,
+        uint256 cumulativeAmount,
+        bytes32 deliverable,
         bytes calldata optParams
     ) internal {
         Job storage job = jobs[jobId];
         if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
-        if (job.status != JobStatus.Submitted) revert WrongStatus();
-        if (actor != job.evaluator) revert Unauthorized();
+        if (actor != job.client) revert Unauthorized();
+        if (job.status != JobStatus.Funded) revert WrongStatus();
+        if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
+        if (block.timestamp >= job.expiredAt) revert WrongStatus();
+        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
+        if (cumulativeAmount > job.budget) revert ExceedsBudget();
 
-        bytes memory data = abi.encode(actor, reason, optParams);
-        _beforeHook(job.hook, jobId, this.complete.selector, data);
+        uint256 delta = cumulativeAmount - job.settledAmount;
+        bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
+        _beforeHook(job.hook, jobId, this.settle.selector, data);
 
-        job.status = JobStatus.Completed;
+        bool drained = _applySettlement(jobId, job, cumulativeAmount, delta, this.settle.selector, optParams);
+        emit ClaimSettled(jobId, actor, cumulativeAmount, delta, deliverable);
+        if (drained) _terminalizeOnDrain(jobId, job, actor);
 
-        uint256 amount = job.budget - job.settledAmount;
-        uint256 platformFee = (amount * platformFeeBP) / 10000;
-        uint256 evalFee = (amount * evaluatorFeeBP) / 10000;
-        uint256 net = amount - platformFee - evalFee;
-
-        IERC20 token = IERC20(job.paymentToken);
-        if (platformFee > 0) {
-            token.safeTransfer(platformTreasury, platformFee);
-            emit PlatformFeePaid(jobId, platformTreasury, platformFee);
-        }
-        if (evalFee > 0) {
-            token.safeTransfer(job.evaluator, evalFee);
-            emit EvaluatorFeePaid(jobId, job.evaluator, evalFee);
-        }
-        _payout(jobId, job, net, this.complete.selector, optParams);
-
-        emit JobCompleted(jobId, actor, reason);
-
-        _afterHook(job.hook, jobId, this.complete.selector, data);
+        _afterHook(job.hook, jobId, this.settle.selector, data);
     }
 
-    /// @notice Rejects a job. Refunds escrowed funds to the client if applicable.
-    /// @dev    Authorization depends on status and evaluator:
-    ///         - Open: client or provider
-    ///         - Funded/Submitted: evaluator only
-    /// @param jobId The job to reject
+    /// @notice Releases escrow toward the provider by resolving a STANDING provider
+    ///         assertion — completing a final delivery (Submitted) or approving a pending
+    ///         claim. Callable by the client or evaluator. A direct payment with no
+    ///         standing assertion is `settle` (client-only), not `release`.
+    ///         - Submitted (final delivery): pays the full remaining escrow and completes
+    ///           the job; `cumulativeAmount` must equal the budget.
+    ///         - Funded with a pending claim: must match that exact claim, approving it.
+    ///         Draining the escrow (settledAmount == budget) completes the job.
+    ///         `deliverable` doubles as the release memo / attestation.
+    /// @param jobId The job to release against
+    /// @param cumulativeAmount Cumulative amount to settle to (must be <= budget)
+    /// @param deliverable Settlement attestation / memo; must match a pending claim if one exists
+    /// @param optParams Hook-specific parameters (passed to before/after hooks)
+    function release(
+        uint256 jobId,
+        uint256 cumulativeAmount,
+        bytes32 deliverable,
+        bytes calldata optParams
+    ) external whenNotPaused nonReentrant {
+        _release(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
+    }
+
+    function _release(
+        address actor,
+        uint256 jobId,
+        uint256 cumulativeAmount,
+        bytes32 deliverable,
+        bytes calldata optParams
+    ) internal {
+        Job storage job = jobs[jobId];
+        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
+        if (actor != job.client && actor != job.evaluator) revert Unauthorized();
+
+        if (job.status == JobStatus.Submitted) {
+            // Final-delivery completion: release the full remaining escrow to the provider.
+            if (cumulativeAmount != job.budget) revert ExceedsBudget();
+            bytes memory data =
+                abi.encode(actor, cumulativeAmount, job.budget - job.settledAmount, deliverable, optParams);
+            _beforeHook(job.hook, jobId, this.release.selector, data);
+            _finalize(actor, jobId, job, true, true, deliverable, this.release.selector, optParams);
+            _afterHook(job.hook, jobId, this.release.selector, data);
+            return;
+        }
+
+        if (job.status != JobStatus.Funded) revert WrongStatus();
+
+        // APPROVE path: release acts ONLY on a standing provider assertion. With no
+        // pending claim there is nothing to approve — a direct payment is `settle`
+        // (client-only). This is the trust boundary: the evaluator may resolve a
+        // provider's assertion but may never originate a payment on a bare Funded job.
+        // Not expiry-gated — a filed claim must remain resolvable after expiry.
+        bytes32 pending = pendingClaimHash[jobId];
+        if (pending == bytes32(0)) revert NoPendingClaim();
+        if (pending != _claimHash(cumulativeAmount, deliverable, keccak256(optParams))) revert NoPendingClaim();
+        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
+        if (cumulativeAmount > job.budget) revert ExceedsBudget();
+
+        uint256 delta = cumulativeAmount - job.settledAmount;
+        bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
+        _beforeHook(job.hook, jobId, this.release.selector, data);
+
+        delete pendingClaimHash[jobId];
+        bool drained = _applySettlement(jobId, job, cumulativeAmount, delta, this.release.selector, optParams);
+        emit ClaimApproved(jobId, actor, cumulativeAmount, delta, deliverable);
+        if (drained) _terminalizeOnDrain(jobId, job, actor);
+
+        _afterHook(job.hook, jobId, this.release.selector, data);
+    }
+
+    /// @notice Rejects either a single pending claim (non-terminal) or the whole job
+    ///         (terminal refund), selected by `claimHash`. (Absorbs the former rejectClaim.)
+    /// @dev    - claimHash != 0: cancels that pending claim only; job stays Funded.
+    ///           Callable by client, evaluator, or provider (self-withdrawal).
+    ///         - claimHash == 0: terminal job rejection. Open: client or provider;
+    ///           Funded/Submitted: evaluator only. Refunds the unsettled remainder.
+    /// @param jobId The job to reject against
+    /// @param claimHash The pending claim to cancel, or bytes32(0) to reject the job
     /// @param reason Rejection reason
     /// @param optParams Hook-specific parameters (passed to before/after hooks)
     function reject(
         uint256 jobId,
+        bytes32 claimHash,
         bytes32 reason,
         bytes calldata optParams
     ) external whenNotPaused nonReentrant {
-        _reject(msg.sender, jobId, reason, optParams);
+        _reject(msg.sender, jobId, claimHash, reason, optParams);
     }
 
     function _reject(
         address actor,
         uint256 jobId,
+        bytes32 claimHash,
         bytes32 reason,
         bytes calldata optParams
     ) internal {
         Job storage job = jobs[jobId];
         if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
 
+        if (claimHash != bytes32(0)) {
+            // Claim-scoped cancel: non-terminal withdrawal/denial of a pending claim.
+            if (job.status != JobStatus.Funded) revert WrongStatus();
+            bytes32 stored = pendingClaimHash[jobId];
+            if (stored == bytes32(0) || stored != claimHash) revert NoPendingClaim();
+            // The provider may self-cancel a stale claim to unblock a corrected one.
+            if (actor != job.client && actor != job.evaluator && actor != job.provider) revert Unauthorized();
+
+            bytes memory data = abi.encode(actor, claimHash, reason, optParams);
+            _beforeHook(job.hook, jobId, this.reject.selector, data);
+            delete pendingClaimHash[jobId];
+            emit ClaimRejected(jobId, actor, reason);
+            _afterHook(job.hook, jobId, this.reject.selector, data);
+            return;
+        }
+
+        // Job-scoped terminal rejection.
         if (job.status == JobStatus.Open) {
             if (actor != job.client && actor != job.provider) revert Unauthorized();
         } else if (
@@ -830,28 +951,19 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             revert WrongStatus();
         }
 
-        bytes memory data = abi.encode(actor, reason, optParams);
+        bytes memory data = abi.encode(actor, bytes32(0), reason, optParams);
         if (pendingClaimHash[jobId] != bytes32(0)) {
             // Terminal job rejection also rejects any pending milestone claim, so
             // hooks and indexers observe a closed claim lifecycle.
             delete pendingClaimHash[jobId];
             emit ClaimRejected(jobId, actor, reason);
         }
+        bool refundEligible = (job.status == JobStatus.Funded || job.status == JobStatus.Submitted);
         _beforeHook(job.hook, jobId, this.reject.selector, data);
 
-        JobStatus prev = job.status;
-        job.status = JobStatus.Rejected;
-
-        uint256 refundAmount = job.budget - job.settledAmount;
-        if (
-            (prev == JobStatus.Funded || prev == JobStatus.Submitted) &&
-            refundAmount > 0
-        ) {
-            IERC20(job.paymentToken).safeTransfer(job.client, refundAmount);
-            emit Refunded(jobId, job.client, refundAmount);
-        }
-
-        emit JobRejected(jobId, actor, reason);
+        // reject is the toClient direction of the shared terminal release: it refunds the
+        // unsettled remainder (when escrow was locked) and moves the job to Rejected.
+        _finalize(actor, jobId, job, false, refundEligible, reason, this.reject.selector, optParams);
 
         _afterHook(job.hook, jobId, this.reject.selector, data);
     }
@@ -909,171 +1021,72 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         _payout(jobId, job, net, selector, optParams);
     }
 
+    /// @dev Shared settlement engine for the direct path (`settle`) and the attested
+    ///      path (`release` approving a pending claim). Advances the ledger, distributes
+    ///      the delta, and reports whether the escrow is now fully drained. Callers emit
+    ///      their own path-specific event (ClaimSettled / ClaimApproved) and then, if
+    ///      drained, call _terminalizeOnDrain to project the lifecycle onto Completed.
+    function _applySettlement(
+        uint256 jobId,
+        Job storage job,
+        uint256 cumulativeAmount,
+        uint256 delta,
+        bytes4 selector,
+        bytes calldata optParams
+    ) internal returns (bool drained) {
+        job.settledAmount = cumulativeAmount;
+        _distributeSettlement(jobId, job, delta, selector, optParams);
+        emit Settled(jobId, cumulativeAmount, delta);
+        return cumulativeAmount == job.budget;
+    }
+
+    /// @dev Universal terminal projection: when a settlement drains the escrow
+    ///      (settledAmount == budget) the job is economically closed, so its status
+    ///      follows the ledger to Completed. `actor` is whoever drained the escrow; a
+    ///      client `settle` carries no evaluator attestation, hence the sentinel reason.
+    ///      Invariant: callers reach here with no pending claim — `settle` requires the
+    ///      slot empty, and `release`'s approve path deletes the claim before draining.
+    function _terminalizeOnDrain(uint256 jobId, Job storage job, address actor) internal {
+        job.status = JobStatus.Completed;
+        emit JobCompleted(jobId, actor, bytes32("settled-in-full"));
+    }
+
+    /// @dev Shared terminal-release engine. `complete` and `reject` are mirror twins:
+    ///      both release the unsettled remainder and move the job to a terminal state,
+    ///      differing only in direction — to the provider (Completed, fees applied) or
+    ///      back to the client (Rejected, a plain refund). `refundEligible` is false for
+    ///      an Open-job rejection, where no escrow was ever locked.
+    function _finalize(
+        address actor,
+        uint256 jobId,
+        Job storage job,
+        bool toProvider,
+        bool refundEligible,
+        bytes32 reason,
+        bytes4 selector,
+        bytes calldata optParams
+    ) internal {
+        uint256 remainder = job.budget - job.settledAmount;
+        if (toProvider) {
+            job.status = JobStatus.Completed;
+            if (remainder > 0) _distributeSettlement(jobId, job, remainder, selector, optParams);
+            emit JobCompleted(jobId, actor, reason);
+        } else {
+            job.status = JobStatus.Rejected;
+            if (refundEligible && remainder > 0) {
+                IERC20(job.paymentToken).safeTransfer(job.client, remainder);
+                emit Refunded(jobId, job.client, remainder);
+            }
+            emit JobRejected(jobId, actor, reason);
+        }
+    }
+
     function _claimHash(
         uint256 cumulativeAmount,
         bytes32 deliverable,
         bytes32 optParamsHash
     ) internal pure returns (bytes32) {
         return keccak256(abi.encode(cumulativeAmount, deliverable, optParamsHash));
-    }
-
-    /// @notice Provider submits a pending claim against a funded job.
-    function submitClaim(
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) external whenNotPaused nonReentrant {
-        _submitClaim(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
-    }
-
-    function _submitClaim(
-        address actor,
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) internal {
-        Job storage job = jobs[jobId];
-        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
-        if (actor != job.provider) revert Unauthorized();
-        if (job.status != JobStatus.Funded) revert WrongStatus();
-        if (block.timestamp >= job.expiredAt) revert WrongStatus();
-        if (deliverable == bytes32(0)) revert EmptyDeliverable();
-        if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
-        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
-        if (cumulativeAmount > job.budget) revert ExceedsBudget();
-
-        uint256 delta = cumulativeAmount - job.settledAmount;
-        bytes memory data = abi.encode(actor, cumulativeAmount, deliverable, optParams);
-        _beforeHook(job.hook, jobId, this.submitClaim.selector, data);
-
-        bytes32 claimHash = _claimHash(cumulativeAmount, deliverable, keccak256(optParams));
-        if (submittedClaimHash[jobId][claimHash]) revert ClaimAlreadySubmitted();
-        submittedClaimHash[jobId][claimHash] = true;
-        pendingClaimHash[jobId] = claimHash;
-
-        emit ClaimSubmitted(jobId, actor, cumulativeAmount, delta, deliverable, optParams);
-        _afterHook(job.hook, jobId, this.submitClaim.selector, data);
-    }
-
-    /// @notice Client settles a claim immediately against a funded job.
-    function settleClaim(
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) external whenNotPaused nonReentrant {
-        _settleClaim(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
-    }
-
-    function _settleClaim(
-        address actor,
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) internal {
-        Job storage job = jobs[jobId];
-        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
-        if (actor != job.client) revert Unauthorized();
-        if (job.status != JobStatus.Funded) revert WrongStatus();
-        if (block.timestamp >= job.expiredAt) revert WrongStatus();
-        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
-        if (cumulativeAmount > job.budget) revert ExceedsBudget();
-
-        uint256 delta = cumulativeAmount - job.settledAmount;
-        bytes memory data = abi.encode(actor, cumulativeAmount, deliverable, optParams);
-        _beforeHook(job.hook, jobId, this.settleClaim.selector, data);
-
-        job.settledAmount = cumulativeAmount;
-        _distributeSettlement(jobId, job, delta, this.settleClaim.selector, optParams);
-
-        emit Settled(jobId, cumulativeAmount, delta);
-        emit ClaimSettled(jobId, actor, cumulativeAmount, delta, deliverable);
-
-        _afterHook(job.hook, jobId, this.settleClaim.selector, data);
-    }
-
-    /// @notice Client or evaluator approves a pending nonzero-deliverable claim.
-    function approveClaim(
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) external whenNotPaused nonReentrant {
-        _approveClaim(msg.sender, jobId, cumulativeAmount, deliverable, optParams);
-    }
-
-    function _approveClaim(
-        address actor,
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes calldata optParams
-    ) internal {
-        Job storage job = jobs[jobId];
-        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
-        if (actor != job.client && actor != job.evaluator) revert Unauthorized();
-        if (job.status != JobStatus.Funded) revert WrongStatus();
-
-        bytes32 stored = pendingClaimHash[jobId];
-        if (stored == bytes32(0)) revert NoPendingClaim();
-        if (stored != _claimHash(cumulativeAmount, deliverable, keccak256(optParams))) revert NoPendingClaim();
-        if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
-        if (cumulativeAmount > job.budget) revert ExceedsBudget();
-
-        uint256 delta = cumulativeAmount - job.settledAmount;
-        bytes memory data = abi.encode(actor, cumulativeAmount, deliverable, optParams);
-        _beforeHook(job.hook, jobId, this.approveClaim.selector, data);
-
-        delete pendingClaimHash[jobId];
-        job.settledAmount = cumulativeAmount;
-        _distributeSettlement(jobId, job, delta, this.approveClaim.selector, optParams);
-
-        emit Settled(jobId, cumulativeAmount, delta);
-        emit ClaimApproved(jobId, actor, cumulativeAmount, delta, deliverable);
-
-        _afterHook(job.hook, jobId, this.approveClaim.selector, data);
-    }
-
-    /// @notice Client/evaluator rejects a pending claim, or provider withdraws their own pending claim.
-    function rejectClaim(
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes32 reason,
-        bytes calldata optParams
-    ) external whenNotPaused nonReentrant {
-        _rejectClaim(msg.sender, jobId, cumulativeAmount, deliverable, reason, optParams);
-    }
-
-    function _rejectClaim(
-        address actor,
-        uint256 jobId,
-        uint256 cumulativeAmount,
-        bytes32 deliverable,
-        bytes32 reason,
-        bytes calldata optParams
-    ) internal {
-        Job storage job = jobs[jobId];
-        if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
-        // The provider may self-cancel a stale claim to unblock a corrected claim.
-        if (actor != job.client && actor != job.evaluator && actor != job.provider) revert Unauthorized();
-        if (job.status != JobStatus.Funded) revert WrongStatus();
-
-        bytes32 stored = pendingClaimHash[jobId];
-        if (stored == bytes32(0)) revert NoPendingClaim();
-        if (stored != _claimHash(cumulativeAmount, deliverable, keccak256(optParams))) revert NoPendingClaim();
-
-        bytes memory data = abi.encode(actor, cumulativeAmount, deliverable, reason, optParams);
-        _beforeHook(job.hook, jobId, this.rejectClaim.selector, data);
-
-        // Keep submittedClaimHash consumed; callers must change cumulative amount, deliverable, or optParams to refile.
-        delete pendingClaimHash[jobId];
-        emit ClaimRejected(jobId, actor, reason);
-
-        _afterHook(job.hook, jobId, this.rejectClaim.selector, data);
     }
 
     // ──────────────────── View ────────────────────

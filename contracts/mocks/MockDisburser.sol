@@ -5,9 +5,7 @@ import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
 import "../IDisburser.sol";
 
 interface IReentrantERC8183 {
-    function settleClaim(uint256 jobId, uint256 cumulativeAmount, bytes32 deliverable, bytes calldata optParams)
-        external;
-    function complete(uint256 jobId, bytes32 reason, bytes calldata optParams) external;
+    function release(uint256 jobId, uint256 cumulativeAmount, bytes32 deliverable, bytes calldata optParams) external;
     function claimRefund(uint256 jobId) external;
 }
 
@@ -92,7 +90,7 @@ contract ReentrantDisburser is IDisburser, ERC165 {
             return address(core)
                 .call(
                     abi.encodeCall(
-                        IReentrantERC8183.settleClaim,
+                        IReentrantERC8183.release,
                         (targetJobId, targetAmount, bytes32("reentrant-settle"), bytes(""))
                     )
                 );
@@ -100,7 +98,9 @@ contract ReentrantDisburser is IDisburser, ERC165 {
         if (action == Action.Complete) {
             return address(core)
                 .call(
-                    abi.encodeCall(IReentrantERC8183.complete, (targetJobId, bytes32("reentrant-complete"), bytes("")))
+                    abi.encodeCall(
+                        IReentrantERC8183.release, (targetJobId, targetAmount, bytes32("reentrant-complete"), bytes(""))
+                    )
                 );
         }
         if (action == Action.ClaimRefund) {
