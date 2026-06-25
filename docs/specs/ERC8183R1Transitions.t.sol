@@ -2,40 +2,35 @@
 pragma solidity ^0.8.28;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ERC-8183 R1 — transition test plan (DROP-IN, NOT YET COMPILED)
+// ERC-8183 — settlement transition test plan (DROP-IN, NOT YET COMPILED)
 //
-// This file targets the PROPOSED R1 ABI from docs/erc8183-r1-state-redesign.md:
-//   • JobStatus gains `ClaimPending`
-//   • `reject(jobId, claimHash, …)` is replaced by two intent selectors:
-//       cancelClaim(jobId, reason, params)   — non-terminal, ClaimPending only
-//       terminate(jobId, reason, params)     — terminal refund
+// Targets the converged model in docs/erc8183-r1-state-redesign.md:
+//   • "claim pending" is the orthogonal `pendingClaimHash != 0` flag — NO new JobStatus.
+//   • 5 verbs: submit · settle · release · reject · claimRefund.
+//   • settle is ISOLATED: pure cursor op, not gated by a pending claim; auto-voids an
+//     overtaken claim.
+//   • reject(jobId, claimHash, reason, optParams):
+//       claimHash != 0 → CANCEL that exact claim (status must be Funded; revert on hash
+//                        mismatch — the front-run guard; caller ∈ {provider,client,evaluator});
+//                        job stays Funded ("moves on").
+//       claimHash == 0 → TERMINATE: Open → client|provider; Funded/Submitted → evaluator only;
+//                        voids any pending claim + refunds remainder → Rejected.
+//   • claimRefund: permissionless post-expiry; voids any pending claim + refunds → Expired.
 //
-// It deliberately lives under docs/specs/ (outside foundry's `test` path) so the
-// spec branch stays green: it references symbols that do not exist until R1 is
-// implemented. To run it, implement R1 and `git mv` this file into test/.
+// Lives under docs/specs/ (outside foundry's `test` path) so the spec branch stays green; it
+// asserts the PROPOSED behaviour (e.g. settle-not-gated, reject front-run guard) which differs
+// from the current collapse branch. `git mv` into test/ as step one of the implementation.
 //
-// ── Full transition matrix this suite encodes ────────────────────────────────
-//
-//  state \ verb │ submit(partial) │ submit(full) │ settle(client) │ release        │ cancelClaim     │ terminate            │ claimRefund
-//  ─────────────┼─────────────────┼──────────────┼────────────────┼────────────────┼─────────────────┼──────────────────────┼─────────────
-//  Open(b>0)    │ revert WrongStat│ revert WrongStat (must fund first)             │ revert          │ client|provider→Rej  │ post-exp→Expired
-//  Funded       │ → ClaimPending  │ → Submitted  │ drain→Completed │ revert NoPending│ revert WrongStat │ evaluator → Rejected │ post-exp→Expired
-//               │                 │              │ part → Funded  │                │                 │                      │
-//  ClaimPending │ revert Pending  │ →Submitted(* │ revert WrongStat (no pay-around)│ drain→Completed │ any party→ Funded│ evaluator → Rejected │ revert Pending(pre-exp)
-//               │                 │ supersedes)  │                │ part → Funded  │                 │                      │
-//  Submitted    │ revert WrongStat│ revert WrongStat              │ revert WrongStat│ drain→Completed │ revert WrongStat │ evaluator → Rejected │ post-grace→Expired
-//  Completed    │ all revert WrongStatus (terminal)                                                                          │
-//  Rejected     │ all revert WrongStatus (terminal)                                                                          │
-//  Expired      │ all revert WrongStatus (terminal)                                                                          │
-//
-//  (*) submit(full) from ClaimPending supersedes the pending claim and routes to Submitted,
-//      preserving the branch's "final submit supersedes a pending milestone" behaviour.
-//
-//  Authorisation summary (the trust boundary, unchanged from the collapse branch):
-//   • settle      → client only            (originate a payment)
-//   • release     → client | evaluator     (resolve a standing assertion)
-//   • cancelClaim → client | evaluator | provider (provider may self-withdraw a stale claim)
-//   • terminate   → Open: client|provider; Funded/ClaimPending/Submitted: evaluator only
+// ── Transition matrix encoded ────────────────────────────────────────────────
+//  state[flag] \ verb │ submit             │ settle (client)        │ release (cli|eval)   │ reject(hash) (any party) │ reject(0)                    │ claimRefund (anyone)
+//  ───────────────────┼────────────────────┼────────────────────────┼──────────────────────┼──────────────────────────┼──────────────────────────────┼─────────────────────
+//  Open(b>0)          │ revert WrongStatus │ revert WrongStatus     │ revert               │ revert WrongStatus       │ client|prov → Rejected       │ post-exp → Expired
+//  Funded[no flag]    │ <bud→set flag      │ advance / drain→Compl  │ revert NoPendingClaim│ revert NoPendingClaim    │ evaluator → Rejected+refund  │ post-exp → Expired
+//                     │ =bud→Submitted     │                        │                      │ (no claim to match)      │ (client/prov → Unauthorized) │
+//  Funded[flag]       │ revert PendingClaim│ advance; AUTO-VOID if  │ match→approve;       │ match→cancel→Funded;     │ evaluator → void+refund→Rej  │ post-exp → void+Expired
+//                     │ (resolve first)    │ overtaken; drain→Compl │ drain→Compl else Fund│ MISMATCH→revert (TOCTOU) │ (client/prov → Unauthorized) │
+//  Submitted          │ revert WrongStatus │ revert WrongStatus     │ =budget→Completed    │ revert WrongStatus       │ evaluator → Rejected+refund  │ post-grace → Expired
+//  Completed/Rejected/Expired → all revert WrongStatus (terminal/absorbing)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {Test} from "forge-std/Test.sol";
@@ -44,7 +39,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ERC8183} from "../../contracts/ERC8183.sol";
 import {MockUSDC} from "../../contracts/mocks/MockUSDC.sol";
 
-contract ERC8183R1TransitionsTest is Test {
+contract ERC8183TransitionsTest is Test {
     uint256 constant BUDGET = 20_000_000; // 20 USDC
     uint256 constant HALF = 10_000_000; // 10 USDC
 
@@ -70,7 +65,7 @@ contract ERC8183R1TransitionsTest is Test {
         usdc.approve(address(core), BUDGET);
     }
 
-    // ── state builders ────────────────────────────────────────────────────────
+    // ── helpers ─────────────────────────────────────────────────────────────────
 
     function _funded() internal returns (uint256 jobId) {
         vm.prank(client);
@@ -81,260 +76,223 @@ contract ERC8183R1TransitionsTest is Test {
         core.fund(jobId, address(usdc), BUDGET, "");
     }
 
-    function _claimPending() internal returns (uint256 jobId) {
+    /// @dev files a partial milestone claim of HALF; returns the claim hash for reject/release.
+    function _claimPending() internal returns (uint256 jobId, bytes32 claimHash) {
         jobId = _funded();
         vm.prank(provider);
-        core.submit(jobId, HALF, bytes32("milestone-1"), ""); // partial → ClaimPending
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.ClaimPending));
+        core.submit(jobId, HALF, bytes32("m1"), "");
+        claimHash = core.pendingClaimHash(jobId);
+        assertTrue(claimHash != bytes32(0), "claim should be pending");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded), "claim pends on Funded");
     }
 
     function _submitted() internal returns (uint256 jobId) {
         jobId = _funded();
         vm.prank(provider);
-        core.submit(jobId, BUDGET, bytes32("final"), ""); // full → Submitted
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Submitted));
-    }
-
-    function _status(uint256 jobId) internal view returns (ERC8183.JobStatus) {
-        (,,, ERC8183.JobStatus status,,,,,,,,) = _job(jobId);
-        return status;
-    }
-
-    // NB: adapt destructuring to the real getter shape at implementation time.
-    function _job(uint256 jobId)
-        internal
-        view
-        returns (
-            address, address, address, ERC8183.JobStatus, uint48, uint48, uint256, address, address, uint256, string memory, uint256
-        )
-    {
-        return core.jobs(jobId);
-    }
-
-    // ── Funded: the legal moves ─────────────────────────────────────────────────
-
-    function test_funded_submitPartial_toClaimPending() public {
-        uint256 jobId = _funded();
-        vm.prank(provider);
-        core.submit(jobId, HALF, bytes32("m1"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.ClaimPending));
-    }
-
-    function test_funded_submitFull_toSubmitted() public {
-        uint256 jobId = _funded();
-        vm.prank(provider);
         core.submit(jobId, BUDGET, bytes32("final"), "");
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Submitted));
     }
 
-    function test_funded_settlePartial_staysFunded() public {
-        uint256 jobId = _funded();
+    // NB: adapt the destructure arity to the real Job getter at implementation time.
+    function _status(uint256 jobId) internal view returns (ERC8183.JobStatus status) {
+        (, status,,,,,,,,,,,) = core.jobs(jobId);
+    }
+
+    // ── reject(hash): CANCEL a claim, job moves on ───────────────────────────────
+
+    function test_rejectHash_byProvider_cancels_movesOn() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
+        vm.prank(provider);
+        core.reject(jobId, h, bytes32("withdraw"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+    }
+
+    function test_rejectHash_byClient_cancels_movesOn() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
         vm.prank(client);
-        core.settle(jobId, HALF, bytes32("memo"), "");
+        core.reject(jobId, h, bytes32("deny"), "");
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
     }
 
-    function test_funded_settleFull_drainsToCompleted() public {
-        uint256 jobId = _funded();
-        vm.prank(client);
-        core.settle(jobId, BUDGET, bytes32("memo"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
-    }
-
-    function test_funded_terminate_byEvaluator_toRejected_refunds() public {
-        uint256 jobId = _funded();
-        uint256 balBefore = usdc.balanceOf(client);
+    function test_rejectHash_byEvaluator_cancels_movesOn() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
         vm.prank(evaluator);
-        core.terminate(jobId, bytes32("no-good"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
-        assertEq(usdc.balanceOf(client), balBefore + BUDGET);
+        core.reject(jobId, h, bytes32("arbiter-deny"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
     }
 
-    // ── Funded: the illegal moves ───────────────────────────────────────────────
+    /// @dev after cancel the provider may re-submit — proves the job genuinely moved on.
+    function test_rejectHash_thenResubmit_succeeds() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
+        vm.prank(provider);
+        core.reject(jobId, h, bytes32("withdraw"), "");
+        vm.prank(provider);
+        core.submit(jobId, HALF + 1, bytes32("m1-corrected"), "");
+        assertTrue(core.pendingClaimHash(jobId) != bytes32(0));
+    }
 
-    function test_funded_release_revertsNoPendingClaim() public {
-        uint256 jobId = _funded();
+    // ── reject(hash): THE FRONT-RUN / TOCTOU GUARD ───────────────────────────────
+
+    /// @dev Caller intends to cancel claim `h`, but it was rescinded first. The non-zero
+    ///      claimHash + exact-match guard makes this REVERT — it must NOT fall through to
+    ///      terminating the job. This is the scenario the design exists to prevent.
+    function test_rejectHash_staleClaim_reverts_doesNotTerminate() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
+
+        // provider front-runs: cancels the claim before the client's cancel lands
+        vm.prank(provider);
+        core.reject(jobId, h, bytes32("rescinded"), "");
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+
+        // client's stale cancel now executes against "no pending claim" → must revert, NOT terminate
         vm.expectRevert(ERC8183.NoPendingClaim.selector);
-        vm.prank(evaluator);
-        core.release(jobId, HALF, bytes32("x"), "");
+        vm.prank(client);
+        core.reject(jobId, h, bytes32("late-cancel"), "");
+
+        // the job survived — it was NOT closed
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
     }
 
-    function test_funded_cancelClaim_revertsWrongStatus() public {
-        uint256 jobId = _funded();
+    /// @dev A claimHash that never matched also reverts (cannot be coerced into a terminate).
+    function test_rejectHash_wrongHash_reverts() public {
+        (uint256 jobId,) = _claimPending();
+        vm.expectRevert(ERC8183.NoPendingClaim.selector);
+        vm.prank(client);
+        core.reject(jobId, keccak256("not-the-claim"), bytes32("x"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+    }
+
+    /// @dev reject(hash) is only valid on Funded; on Submitted it reverts on status.
+    function test_rejectHash_onSubmitted_revertsWrongStatus() public {
+        uint256 jobId = _submitted();
         vm.expectRevert(ERC8183.WrongStatus.selector);
         vm.prank(client);
-        core.cancelClaim(jobId, bytes32("x"), "");
+        core.reject(jobId, keccak256("anything"), bytes32("x"), "");
     }
 
-    function test_funded_settle_byEvaluator_revertsUnauthorized() public {
+    // ── reject(0): TERMINATE, status + auth gated ────────────────────────────────
+
+    function test_reject0_byEvaluator_onFunded_terminates_refunds() public {
+        uint256 jobId = _funded();
+        uint256 bal = usdc.balanceOf(client);
+        vm.prank(evaluator);
+        core.reject(jobId, bytes32(0), bytes32("kill"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
+        assertEq(usdc.balanceOf(client), bal + BUDGET);
+    }
+
+    /// @dev evaluator reject(0) terminates even with a claim pending (voids it) — no DoS wedge.
+    function test_reject0_byEvaluator_withPendingClaim_voidsAndTerminates() public {
+        (uint256 jobId,) = _claimPending();
+        vm.prank(evaluator);
+        core.reject(jobId, bytes32(0), bytes32("kill"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+    }
+
+    /// @dev THE RESIDUAL, bounded: client/provider passing 0 on Funded cannot terminate.
+    function test_reject0_byClient_onFunded_revertsUnauthorized() public {
+        uint256 jobId = _funded();
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(client);
+        core.reject(jobId, bytes32(0), bytes32("x"), "");
+    }
+
+    function test_reject0_byProvider_onFunded_revertsUnauthorized() public {
+        uint256 jobId = _funded();
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(provider);
+        core.reject(jobId, bytes32(0), bytes32("x"), "");
+    }
+
+    function test_reject0_onSubmitted_byEvaluator_terminates() public {
+        uint256 jobId = _submitted();
+        vm.prank(evaluator);
+        core.reject(jobId, bytes32(0), bytes32("reject-delivery"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
+    }
+
+    // ── settle ISOLATED: not gated by a pending claim ────────────────────────────
+
+    function test_settle_notBlockedByPendingClaim() public {
+        (uint256 jobId,) = _claimPending();
+        // client settles BELOW the claim amount: claim survives, cursor advances
+        vm.prank(client);
+        core.settle(jobId, HALF - 1, bytes32("memo"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+        assertTrue(core.pendingClaimHash(jobId) != bytes32(0), "sub-claim settle leaves claim pending");
+    }
+
+    function test_settle_overtakesClaim_autoVoids() public {
+        (uint256 jobId,) = _claimPending(); // claim at HALF
+        vm.prank(client);
+        core.settle(jobId, HALF + 1, bytes32("memo"), ""); // overtakes the claim
+        assertEq(core.pendingClaimHash(jobId), bytes32(0), "overtaken claim auto-voided");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+    }
+
+    function test_settle_drainsWhilePending_completes_voidsClaim() public {
+        (uint256 jobId,) = _claimPending();
+        vm.prank(client);
+        core.settle(jobId, BUDGET, bytes32("pay-all"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+    }
+
+    function test_settle_byEvaluator_revertsUnauthorized() public {
         uint256 jobId = _funded();
         vm.expectRevert(ERC8183.Unauthorized.selector);
         vm.prank(evaluator);
         core.settle(jobId, HALF, bytes32("x"), "");
     }
 
-    function test_funded_terminate_byStranger_revertsUnauthorized() public {
-        uint256 jobId = _funded();
-        vm.expectRevert(ERC8183.Unauthorized.selector);
-        vm.prank(stranger);
-        core.terminate(jobId, bytes32("x"), "");
-    }
+    // ── release: resolve a standing assertion ────────────────────────────────────
 
-    // ── ClaimPending: the legal moves ───────────────────────────────────────────
-
-    function test_claimPending_releaseApprove_partial_backToFunded() public {
-        uint256 jobId = _claimPending();
+    function test_release_matchingClaim_partial_backToFunded() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
+        h; // hash is over (cumulativeAmount, deliverable, optParamsHash)
         vm.prank(evaluator);
-        core.release(jobId, HALF, bytes32("milestone-1"), "");
+        core.release(jobId, HALF, bytes32("m1"), "");
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
     }
 
-    function test_claimPending_releaseApprove_drain_toCompleted() public {
-        // a full-budget milestone, approved, drains the escrow
-        uint256 jobId = _funded();
-        vm.prank(provider);
-        core.submit(jobId, BUDGET - 1, bytes32("m"), "");
-        vm.prank(client);
-        core.release(jobId, BUDGET - 1, bytes32("m"), ""); // partial → Funded
-        vm.prank(client);
-        core.settle(jobId, BUDGET, bytes32("rest"), ""); // drains
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
-    }
-
-    function test_claimPending_cancelClaim_byProvider_backToFunded() public {
-        uint256 jobId = _claimPending();
-        vm.prank(provider); // provider self-withdraws a stale claim
-        core.cancelClaim(jobId, bytes32("withdrawn"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
-    }
-
-    function test_claimPending_cancelClaim_byEvaluator_backToFunded() public {
-        uint256 jobId = _claimPending();
-        vm.prank(evaluator);
-        core.cancelClaim(jobId, bytes32("denied"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
-    }
-
-    function test_claimPending_submitFull_supersedes_toSubmitted() public {
-        uint256 jobId = _claimPending();
-        vm.prank(provider);
-        core.submit(jobId, BUDGET, bytes32("final"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Submitted));
-    }
-
-    function test_claimPending_terminate_byEvaluator_toRejected() public {
-        uint256 jobId = _claimPending();
-        vm.prank(evaluator);
-        core.terminate(jobId, bytes32("kill"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
-    }
-
-    // ── ClaimPending: the illegal moves (incl. the no-pay-around guarantee) ──────
-
-    function test_claimPending_settle_revertsWrongStatus_noPayAround() public {
-        // THE structural no-pay-around guarantee: settle is simply not a transition
-        // out of ClaimPending. No PendingClaimExists guard needed — wrong state.
-        uint256 jobId = _claimPending();
-        vm.expectRevert(ERC8183.WrongStatus.selector);
-        vm.prank(client);
-        core.settle(jobId, BUDGET, bytes32("around"), "");
-    }
-
-    function test_claimPending_submitPartial_revertsPendingClaimExists() public {
-        uint256 jobId = _claimPending();
-        vm.expectRevert(ERC8183.PendingClaimExists.selector);
-        vm.prank(provider);
-        core.submit(jobId, HALF + 1, bytes32("m2"), "");
-    }
-
-    function test_claimPending_release_mismatchedClaim_revertsNoPendingClaim() public {
-        uint256 jobId = _claimPending();
+    function test_release_mismatch_reverts() public {
+        (uint256 jobId,) = _claimPending();
         vm.expectRevert(ERC8183.NoPendingClaim.selector);
         vm.prank(evaluator);
-        core.release(jobId, HALF, bytes32("WRONG-deliverable"), "");
+        core.release(jobId, HALF, bytes32("WRONG"), "");
     }
 
-    // ── The footgun is gone ──────────────────────────────────────────────────────
-
-    /// @dev Under the collapse branch, reject(jobId, bytes32(0), …) terminated the whole
-    ///      job. Under R1 there is no zero-sentinel: cancelClaim cancels the claim, and is
-    ///      the ONLY non-terminal denial. A caller cannot accidentally terminate the job by
-    ///      defaulting an argument — terminate is a distinct selector with evaluator-only authz.
-    function test_footgun_cancelClaim_neverTerminatesJob() public {
-        uint256 jobId = _claimPending();
-        uint256 balBefore = usdc.balanceOf(client);
-        vm.prank(provider);
-        core.cancelClaim(jobId, bytes32("oops"), "");
-        // job survives, escrow untouched, no refund triggered
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
-        assertEq(usdc.balanceOf(client), balBefore);
-    }
-
-    /// @dev A non-evaluator cannot terminate a Funded/ClaimPending job at all — so even the
-    ///      "wrong intent" path fails closed rather than moving money.
-    function test_footgun_provider_cannotTerminate_claimPending() public {
-        uint256 jobId = _claimPending();
-        vm.expectRevert(ERC8183.Unauthorized.selector);
-        vm.prank(provider);
-        core.terminate(jobId, bytes32("x"), "");
-    }
-
-    // ── Submitted: legal + illegal ───────────────────────────────────────────────
-
-    function test_submitted_release_byClient_completes() public {
-        // The branch's "client can now complete a Submitted job" behaviour is preserved.
-        uint256 jobId = _submitted();
-        vm.prank(client);
-        core.release(jobId, BUDGET, bytes32("ok"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
-    }
-
-    function test_submitted_release_byEvaluator_completes() public {
-        uint256 jobId = _submitted();
-        vm.prank(evaluator);
-        core.release(jobId, BUDGET, bytes32("ok"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
-    }
-
-    function test_submitted_terminate_byEvaluator_toRejected() public {
-        uint256 jobId = _submitted();
-        vm.prank(evaluator);
-        core.terminate(jobId, bytes32("reject-delivery"), "");
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Rejected));
-    }
-
-    function test_submitted_settle_revertsWrongStatus() public {
-        uint256 jobId = _submitted();
-        vm.expectRevert(ERC8183.WrongStatus.selector);
-        vm.prank(client);
-        core.settle(jobId, BUDGET, bytes32("x"), "");
-    }
-
-    function test_submitted_cancelClaim_revertsWrongStatus() public {
-        uint256 jobId = _submitted();
-        vm.expectRevert(ERC8183.WrongStatus.selector);
-        vm.prank(client);
-        core.cancelClaim(jobId, bytes32("x"), "");
-    }
-
-    // ── Expiry / liveness preserved ──────────────────────────────────────────────
-
-    function test_funded_claimRefund_postExpiry_toExpired() public {
+    function test_release_onFundedNoClaim_revertsNoPendingClaim() public {
         uint256 jobId = _funded();
+        vm.expectRevert(ERC8183.NoPendingClaim.selector);
+        vm.prank(client);
+        core.release(jobId, HALF, bytes32("x"), "");
+    }
+
+    function test_release_submitted_byClient_completes() public {
+        uint256 jobId = _submitted();
+        vm.prank(client);
+        core.release(jobId, BUDGET, bytes32("ok"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
+    }
+
+    // ── claimRefund: permissionless anti-stale backstop ──────────────────────────
+
+    function test_claimRefund_postExpiry_voidsPendingClaim_refunds() public {
+        (uint256 jobId,) = _claimPending();
         vm.warp(block.timestamp + 3601);
-        uint256 balBefore = usdc.balanceOf(client);
-        core.claimRefund(jobId); // anyone
-        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Expired));
-        assertEq(usdc.balanceOf(client), balBefore + BUDGET);
-    }
-
-    function test_claimPending_claimRefund_preExpiry_revertsPendingClaimExists() public {
-        uint256 jobId = _claimPending();
-        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        uint256 bal = usdc.balanceOf(client);
+        vm.prank(stranger); // anyone
         core.claimRefund(jobId);
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Expired));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+        assertEq(usdc.balanceOf(client), bal + BUDGET);
     }
 
-    // ── Terminal states are absorbing ────────────────────────────────────────────
+    // ── terminal states are absorbing ────────────────────────────────────────────
 
     function test_completed_isTerminal() public {
         uint256 jobId = _funded();
@@ -342,13 +300,13 @@ contract ERC8183R1TransitionsTest is Test {
         core.settle(jobId, BUDGET, bytes32("done"), "");
         vm.expectRevert(ERC8183.WrongStatus.selector);
         vm.prank(evaluator);
-        core.terminate(jobId, bytes32("too-late"), "");
+        core.reject(jobId, bytes32(0), bytes32("too-late"), "");
     }
 
     function test_rejected_isTerminal() public {
         uint256 jobId = _funded();
         vm.prank(evaluator);
-        core.terminate(jobId, bytes32("kill"), "");
+        core.reject(jobId, bytes32(0), bytes32("kill"), "");
         vm.expectRevert(ERC8183.WrongStatus.selector);
         vm.prank(provider);
         core.submit(jobId, HALF, bytes32("m"), "");

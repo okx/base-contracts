@@ -1,222 +1,232 @@
-# ERC-8183 R1 — State-Machine Redesign (spec)
+# ERC-8183 — Settlement State-Transition Spec (converged)
 
 **Status:** design proposal, not implemented. This branch carries the spec and a drop-in
 transition test plan only.
-**Builds on:** `experiment/collapse-settlement-flow` (the 8→5 verb collapse). R1 keeps that
-collapsed surface but attacks the problem from the *state* side instead of the *verb* side.
+**Builds on:** `experiment/collapse-settlement-flow` (the 8→5 verb collapse). This spec keeps
+that collapsed 5-verb surface and specifies how the *pending-claim* sub-state transitions,
+who is authorized, and how DoS / front-running is prevented.
+
+> **Supersedes the earlier "promote ClaimPending to a JobStatus" draft.** A five-angle review
+> (DoS red-team, state-machine formalism, authorization/trust, prior-art survey, EVM/upgrade
+> pragmatics) converged on a different model: keep "a claim is pending" as an **orthogonal flag**,
+> not a new enum state. The reasons are recorded in §2.
 
 ---
 
-## 1. Why touch the state machine at all
+## 1. The 5-verb surface (unchanged)
 
-The verb collapse merged the public functions but left the **lifecycle spread across three
-overlapping representations**:
+```
+submit · settle · release · reject · claimRefund
+```
 
-| Dimension | Encoded in | Distinct values |
+| Verb | Caller | Role |
 |---|---|---|
-| Lifecycle phase | `JobStatus` enum | 6 (`Open, Funded, Submitted, Completed, Rejected, Expired`) |
-| "Is a milestone claim pending?" | `pendingClaimHash[jobId] != 0` | 2 — **implicit**, not a named state |
-| Economic progress | `settledAmount` vs `budget` | `0` / partial / drained |
-
-The state the contract actually operates on is the **product** of these, yet only the first is
-a named, enumerable state. Every rough edge in the collapsed branch traces back to that gap:
-
-| Rough edge (in `experiment/collapse-settlement-flow`) | Root cause |
-|---|---|
-| `release` is "state-dispatched" (complete vs approve) | it must read `status × pendingClaimHash` to know its own effect |
-| `reject(jobId, claimHash, …)` overload — `claimHash == 0` silently means "terminate the whole job" | "cancel the claim" vs "terminate the job" is a distinction the **state** doesn't carry, so it's pushed into a calldata sentinel |
-| `_terminalizeOnDrain` projection + the old "paid-but-open" zombie | terminal status is **assigned**, not **derived** from the cursor |
-| `PendingClaimExists` re-checked in `submit` / `settle` / `reject` / `claimRefund` | four functions independently re-derive the same implicit "a claim is pending" sub-state |
-| `claimRefund`'s 3-way branch (`Submitted` / `hasPendingClaim` / else) | same implicit sub-state, re-derived again |
-
-**R1's thesis:** promote the implicit "a claim is pending" sub-state into a first-class
-`JobStatus`. Once the state machine carries the distinction, the dispatch ambiguity and the
-`reject` footgun stop being things you *guard against* and become things that are *structurally
-impossible* (invalid transitions).
-
-> R1 is the smallest state change that removes the footgun. The more ambitious normalization
-> (model the assertion as a tagged union and *derive* terminal status from the cursor) is
-> sketched in §7 as R2; it is out of scope for this spec.
+| `submit(jobId, cumulativeAmount, deliverable, optParams)` | provider | `== budget` → final delivery (Submitted); `< budget` → files a pending milestone claim |
+| `settle(jobId, cumulativeAmount, deliverable, optParams)` | client | **isolated** direct payment; pure cursor op (see §4) |
+| `release(jobId, cumulativeAmount, deliverable, optParams)` | client \| evaluator | resolve a standing assertion (approve a claim, or complete a Submitted delivery) |
+| `reject(jobId, claimHash, reason, optParams)` | scoped (see §5) | `claimHash != 0` cancels that exact claim (job continues); `claimHash == 0` terminates the job |
+| `claimRefund(jobId)` | anyone | post-expiry backstop; voids any stale claim + refunds remainder |
 
 ---
 
-## 2. The new state set
+## 2. State model: orthogonal flag, NOT a new status
+
+`JobStatus` stays at its existing **6** members:
 
 ```solidity
-enum JobStatus {
-    Open,          // created, budget may be 0, not yet funded
-    Funded,        // escrow locked, no standing assertion
-    ClaimPending,  // NEW — a milestone claim is filed and awaiting release/cancel
-    Submitted,     // final delivery asserted; awaiting terminal release/reject
-    Completed,     // terminal: escrow fully released to provider
-    Rejected,      // terminal: job terminated by arbiter, remainder refunded
-    Expired        // terminal: job timed out, remainder refunded
-}
+enum JobStatus { Open, Funded, Submitted, Completed, Rejected, Expired }   // unchanged
 ```
 
-One state added: **`ClaimPending`**. It is exactly the old `Funded && pendingClaimHash != 0`
-condition, lifted out of the side mapping and into the enum. `pendingClaimHash` is still stored
-(we need the hash to match an approval against the exact claim), but it is **no longer the thing
-branched on** — `status` is. The mapping becomes pure data, not control flow.
+"A milestone claim is pending" is carried by the existing `pendingClaimHash[jobId] != 0`
+mapping — an **orthogonal boolean dimension riding on `Funded`**, plus the monotonic
+`settledAmount` cursor. We deliberately do **not** add a `ClaimPending` enum member.
 
-### Invariant tying state to the ledger
+Why flag, not status (the two decisive findings):
+
+1. **Orthogonality (state-machine formalism).** Once `settle` is isolated (§4), the funding
+   phase and the claim bit evolve *independently* — `settle` advances the cursor regardless of
+   whether a claim pends. Independent dimensions are an orthogonal region (a *product*), not a
+   flattened sibling state. Promoting it to the enum would force `status` and `pendingClaimHash`
+   to be kept in sync (a drift-prone biconditional invariant); the flag *is* the only
+   representation, so nothing can drift.
+2. **Upgrade safety (EVM pragmatics).** This is a live upgradeable proxy whose `Job` struct is
+   "append-only" for layout safety. Inserting `ClaimPending` mid-enum renumbers the persisted
+   `status` byte of every live job ≥ `Submitted` (corruption); even appending it forces a
+   migration of in-flight `Funded + pendingClaimHash` jobs. The flag costs **zero** layout
+   change and is already correct on-chain.
+
+The footgun fix and the clean lifecycle do **not** require an enum change — they come from the
+`reject` shape (§5) and disciplined events, which sit on top of the existing flag.
+
+### Invariants
 
 ```
-status ∈ {Funded, ClaimPending, Submitted}  ⟹  settledAmount < budget   (escrow still has funds)
-status == Completed                          ⟹  settledAmount == budget   (drained to provider)
-status ∈ {Rejected, Expired}                 ⟹  remainder (budget-settledAmount) refunded to client
-pendingClaimHash != 0                         ⟺  status == ClaimPending     (biconditional — the key win)
+pendingClaimHash != 0   ⟹  status == Funded            (a claim only pends on Funded)
+status == Completed      ⟹  settledAmount == budget      (drained to provider)
+status ∈ {Rejected,Expired} ⟹ remainder refunded to client
+settledAmount             monotonic (never decreases)    (cross-path double-pay defense)
+every exit from Funded clears pendingClaimHash before/at the status change (no claim survives into a terminal state)
 ```
-
-The last line is the point: the side mapping and the status can never disagree, because they
-are now two views of one fact.
 
 ---
 
 ## 3. State diagram
 
 ```
-                          fund
-        ┌────────┐  (budget>0)   ┌──────────┐
-        │  Open  │ ────────────► │  Funded  │ ◄───────────────┐
-        └───┬────┘               └────┬─────┘                 │
-            │                         │                       │ release(approve)  /
-            │ reject (client|provider)│                       │ reject(cancel)    → back to Funded
-            │ — Open-scope, no escrow │                       │ (when claim does NOT drain)
-            ▼                         │                       │
-        ┌────────┐                   │ submit(partial)        │
-        │Rejected│◄──┐               ├──────────────────► ┌───┴────────┐
-        └────────┘   │               │                    │ClaimPending│
-                     │ reject (job)  │                    └───┬────────┘
-                     │ EVALUATOR     │ submit(full,         │
-                     │               │   supersedes any     │ release(approve) → drains → Completed
-        ┌──────────┐ │   pending claim)                     │ reject(cancel)   → Funded
-        │ Submitted│─┘               │                      │ terminate (EVALUATOR) → Rejected
-        └────┬─────┘                 ▼
-             │            ┌──────────────┐
-   release   │            │   Completed  │  ◄── settle (CLIENT) drains, from Funded
- (EVALUATOR| │            └──────────────┘      release drains, from ClaimPending/Submitted
-  CLIENT)    │
-   → Completed
-             │
-             └── terminate (EVALUATOR) → Rejected
-                 claimRefund (anyone, post-grace) → Expired
-
-   Any of {Open(budget>0), Funded, ClaimPending, Submitted} ── claimRefund (post-expiry) ──► Expired
+                       fund (budget>0)
+        ┌──────┐  ───────────────────►  ┌────────────────────────────┐
+        │ Open │                         │           Funded           │ ◄──────────┐
+        └──┬───┘                         │  (pendingClaimHash = flag) │            │
+           │ reject(0) [client|provider] └───┬───────────────┬────────┘            │
+           ▼   (no escrow)                   │               │                     │
+        ┌────────┐                           │ submit(<bud)  │ submit(=bud)        │ reject(hash)
+        │Rejected│ ◄──────────┐              │ [provider]    │ [provider]          │ [prov|client|eval]
+        └────────┘            │              │ set flag      │ (must have NO       │ cancel claim
+              ▲               │              ▼   no flag→set │  pending claim;     │ → clears flag
+   reject(0) [evaluator]      │          Funded[flag]        │  else revert)       │ (job moves on)
+   void claim + refund        │              │   ▲           ▼                     │
+   ───────────────────────────┘              │   └───────────┐                     │
+                                             │   settle/release (resolve)          │
+   Funded[flag] ── settle [client] ──► advance cursor; AUTO-VOID claim if overtaken; drain→Completed
+   Funded[flag] ── release(match) [client|eval] ──► approve; clear flag; drain→Completed else →Funded
+   Funded[flag] ── reject(hash) [prov|client|eval] ──► clear flag → Funded ───────────┘
+   Funded[flag] ── reject(0) [evaluator] ──► void claim + refund → Rejected
+   Submitted ── release(=budget) [client|eval] ──► Completed
+   Submitted ── reject(0) [evaluator] ──► refund → Rejected
+   {Open(b>0),Funded[±flag],Submitted} ── claimRefund (anyone, post-expiry) ──► void any claim + refund → Expired
 ```
 
-### What changed vs the collapsed branch
+---
 
-1. **`ClaimPending` is reachable only from `Funded` via `submit(partial)`**, and returns to
-   `Funded` on a non-draining `release`/`reject`, or advances to `Completed` on a draining
-   `release`.
-2. **`settle` is no longer a legal transition from `ClaimPending`.** "No pay-around a standing
-   claim" is now enforced by the *absence of a transition*, not by a `PendingClaimExists` revert
-   inside `settle`.
-3. **`reject` splits by intent (see §4):** a non-terminal **cancel** (only meaningful in
-   `ClaimPending`) and a terminal **`terminate`** (evaluator, from `Funded`/`ClaimPending`/
-   `Submitted`). The `claimHash` calldata sentinel is gone.
+## 4. `settle` is isolated (decided)
+
+`settle` is the client's direct-payment fast-path and operates **purely on the monotonic
+cursor** — it does **not** read the pending-claim flag and is never gated by it.
+
+- `settle(Y)` pays `delta = Y − settledAmount`, sets `settledAmount = Y`.
+- **Overtake rule:** if `Y ≥ the pending claim's cumulativeAmount`, the claim is now
+  satisfied-or-exceeded and un-approvable; `settle` **auto-voids** it (delete the flag, emit
+  `ClaimRejected("overtaken")`). This is the *only* place `settle` touches the claim, and it is
+  in service of not stranding a now-dead claim.
+- **Drain rule:** if `Y == budget`, the job completes (`→ Completed`), voiding any pending claim
+  first.
+
+**Safety (why coexistence is sound):** both `settle` and an approved `release` only ever pay
+`delta` above the monotonic `settledAmount`, and `release` of a claim requires
+`claim.cumulative > settledAmount`. So for any interleaving, total paid `= max(settle target,
+claim target)` — no double-payment. This is the branch's existing monotonic-`settledAmount`
+defense, unchanged. Isolating `settle` also **eliminates the main DoS vector**: a provider can
+no longer hold a pending claim open to block the client from paying down the escrow.
 
 ---
 
-## 4. The verb surface under R1
-
-R1 keeps the collapsed verbs but **replaces the overloaded `reject` with two intent-named
-selectors**, because the residual ambiguity ("cancel the claim" vs "terminate the job while a
-claim pends") is the one distinction the state machine alone cannot carry — both are reachable
-from `ClaimPending`.
-
-| Verb | Caller | Legal from | Effect |
-|---|---|---|---|
-| `submit(jobId, cumulativeAmount, deliverable, params)` | provider | `Open`(budget 0) / `Funded` | `== budget` → `Submitted`; `< budget` → `ClaimPending` |
-| `settle(jobId, cumulativeAmount, deliverable, params)` | **client** | `Funded` | advance cursor; drain → `Completed` (else stays `Funded`) |
-| `release(jobId, cumulativeAmount, deliverable, params)` | client \| evaluator | `ClaimPending` / `Submitted` | resolve the standing assertion; drain → `Completed`, else (`ClaimPending` partial) → `Funded` |
-| `cancelClaim(jobId, reason, params)` | client \| evaluator \| provider | `ClaimPending` | cancel the pending claim → `Funded` (no `claimHash` arg — there is exactly one pending claim) |
-| `terminate(jobId, reason, params)` | Open: client\|provider · Funded/ClaimPending/Submitted: **evaluator** | `Open` / `Funded` / `ClaimPending` / `Submitted` | terminal refund of remainder → `Rejected` |
-| `claimRefund(jobId)` | anyone | post-expiry (Submitted post-grace) | refund remainder → `Expired` |
-
-Net surface: **6 verbs** (`submit, settle, release, cancelClaim, terminate, claimRefund`) — one
-more than the branch's 5, but the extra selector *buys* the elimination of the footgun, removes
-`release`'s magic-combination dispatch, and lets every `PendingClaimExists` guard disappear.
-
-### Why `cancelClaim` needs no `claimHash`
-
-There is **at most one** pending claim per job (the old `pendingClaimHash` is a single slot, and
-`submit(partial)` reverts if one already exists). In `ClaimPending` there is therefore exactly
-one thing to cancel. The argument that made the branch's `reject` dangerous — a hash that
-defaults to zero and silently re-targets the whole job — has no reason to exist here.
-
----
-
-## 5. The footgun, gone
-
-Branch behaviour:
+## 5. `reject` — one verb, `claimHash` selects intent, status validates
 
 ```solidity
-reject(jobId, bytes32(0), reason, "");   // caller MEANT "cancel my claim"
-                                          // ACTUALLY terminates the job + refunds the client
+reject(uint256 jobId, bytes32 claimHash, bytes32 reason, bytes optParams)
 ```
 
-R1 behaviour:
+### claimHash != 0  → CANCEL that exact claim (non-terminal; job moves on)
 
-```solidity
-cancelClaim(jobId, reason, "");   // cancels the claim. Reverts (WrongStatus) if not ClaimPending.
-terminate(jobId, reason, "");     // terminates the job. Distinct selector, distinct authz.
+```
+guard: status == Funded                                   (status check; a claim only pends on Funded)
+guard: pendingClaimHash[jobId] == claimHash               (FRONT-RUN GUARD — revert NoPendingClaim on mismatch)
+auth : caller ∈ {provider, client, evaluator}             (cancel strands nothing → safe for all three)
+effect: delete pendingClaimHash; emit ClaimRejected; status stays Funded
 ```
 
-The two money-different outcomes are now **two selectors** that cannot be confused by a defaulted
-argument. A relayer signing the wrong intent fails closed (wrong selector → wrong typehash →
-signature won't verify; or wrong state → `WrongStatus` revert), instead of silently nuking the
-job.
+The job **moves on**: after the claim is cleared the provider may re-`submit` a corrected claim
+or a final delivery, the client may `settle`, etc.
+
+### claimHash == 0  → TERMINATE the job (terminal refund)
+
+```
+status == Open                → auth: caller ∈ {client, provider} → Rejected (no escrow locked, no refund)
+status ∈ {Funded, Submitted}  → auth: caller == evaluator only     → void any pending claim; refund remainder to client → Rejected
+status terminal               → revert WrongStatus                  (status check)
+```
+
+### Why this is front-run-safe (the TOCTOU scenario, closed)
+
+Cancel-intent carries a **non-zero** `claimHash`. If the targeted claim is rescinded, approved,
+or superseded before the tx lands, `pendingClaimHash != claimHash` → **revert**. A cancel can
+therefore *never* silently degrade into a terminate. The **only** way to terminate is to pass
+`claimHash == 0` explicitly — termination is an opt-in intent, not a fall-through.
+
+This also removes the DoS wedge: `reject(0)` by the evaluator terminates **regardless** of a
+pending claim (it voids the claim on the way out), so a provider cannot re-file fresh-hash claims
+to block termination.
+
+### Residual to mitigate in the signing/relayer UX (documented, accepted)
+
+A caller who *means* to cancel but supplies `claimHash == 0` (uninitialized variable / bad
+relayer default) issues a terminate. Bounded by the status+auth checks:
+- provider/client passing `0` on **Funded** → not authorized to terminate → **reverts** (safe).
+- Only the **evaluator**, only on **Funded/Submitted**, can accidentally terminate via a stray
+  zero — i.e. a trusted arbiter fat-fingering the sentinel.
+
+Mitigation (not a code change): signers/relayers must **never default `claimHash` to zero** for a
+cancel; treat zero as a deliberate "terminate" toggle requiring explicit confirmation. This is the
+inherent trade of a single-selector sentinel design, chosen deliberately to preserve the 5-verb
+surface.
 
 ---
 
-## 6. Storage layout & upgrade safety
+## 6. `claimRefund` — permissionless anti-stale backstop
 
-This contract is `Initializable` / upgradeable, and the `Job` struct comments explicitly say
-"new fields appended to preserve storage layout." R1 must respect that.
+Post-expiry (Submitted: post-grace), **anyone** may call `claimRefund`. It **voids any pending
+claim** and refunds the remainder to the client → `Expired`. It is the one non-hookable exit, so
+no reverting `hook` can permanently strand escrow.
 
-- **`JobStatus` is a `uint8`-backed enum stored in `Job.status`.** Adding `ClaimPending` *in the
-  middle* of the enum (between `Funded` and `Submitted`) **renumbers** `Submitted`/`Completed`/
-  `Rejected`/`Expired`. For a fresh deployment that is fine. For an **upgrade over live jobs it is
-  not** — every persisted `status` value ≥ old `Submitted` would shift meaning.
-  - **Safe option (recommended): append `ClaimPending` at the end of the enum** (value `6`) and
-    *do not* rely on enum ordering for logic. Logic keys off named variants, so position is
-    irrelevant to correctness; only the human-facing diagram groups it logically.
-  - If a clean redeploy (no live jobs to migrate) is on the table, the in-order form in §2 reads
-    better and is acceptable.
-- **No new storage slots required.** `ClaimPending` reuses the existing `status` byte;
-  `pendingClaimHash` already exists. R1 *removes* control-flow dependence on the mapping but keeps
-  the slot, so layout is unchanged.
-- **A migration that touches existing jobs is unnecessary** if `ClaimPending` is appended: any job
-  that was `Funded` with a non-zero `pendingClaimHash` under the old contract is read under R1 by
-  the biconditional in §2 — code paths should treat `Funded + pendingClaimHash != 0` as
-  `ClaimPending` during a transition window, or a one-time normalization pass can flip those jobs'
-  status. This is the one real migration question and must be decided before implementation.
+Liveness across abandonment (no funds ever permanently stranded):
+- **provider abandons** (claim filed, vanishes): client `settle`s around it (isolated) or
+  evaluator `release`s/`reject(0)`s; post-expiry anyone `claimRefund`s.
+- **client abandons**: evaluator `release`s (pay provider) or `reject(0)`s (refund); post-expiry
+  `claimRefund`.
+- **evaluator abandons**: client/provider can still cancel a claim and the client can `settle`;
+  the remainder is recovered post-expiry by the permissionless `claimRefund`.
+
+A pending claim blocks **nothing a counterparty needs** — only the provider's own next `submit`
+(self-inflicted). That is what defeats intentional staling.
 
 ---
 
-## 7. Out of scope: R2 (recorded for completeness)
+## 7. Authorization summary
 
-A more aggressive normalization, **not** specified here:
+| Action | provider | client | evaluator | anyone |
+|---|---|---|---|---|
+| `submit` (file claim / deliver) | ✅ | — | — | — |
+| `settle` (originate payment) | — | ✅ | — | — |
+| `release` (resolve standing assertion) | — | ✅ | ✅ | — |
+| `reject(hash)` (cancel a claim) | ✅ | ✅ | ✅ | — |
+| `reject(0)` on Open (terminate, no escrow) | ✅ | ✅ | — | — |
+| `reject(0)` on Funded/Submitted (terminate + refund) | — | — | ✅ | — |
+| `claimRefund` (post-expiry) | ✅ | ✅ | ✅ | ✅ |
 
-- Replace `JobStatus` with an orthogonal `Phase {Draft, Active, Closed}` plus an explicit
-  `Assertion {kind: None|Milestone|Final, hash}` sub-struct.
-- **Derive** the terminal outcome from the cursor instead of storing `Completed`/`Rejected`:
-  `settledAmount == budget` ⇒ paid out; closed with `settledAmount < budget` ⇒ refunded. This
-  deletes `_terminalizeOnDrain` entirely and makes the "paid-but-open" zombie unrepresentable.
-- Collapse `Rejected` + `Expired` (same economic outcome — terminated, remainder refunded;
-  different trigger) into one terminal state carrying a `trigger`/`reason`.
-
-R2 is the larger storage-layout change and is best considered only if R1's interface is going to
-the standards body anyway.
+Principle: originate = client; resolve = client or evaluator; **reverse/refund = evaluator only**;
+cancel-a-claim = anyone party (safe, strands nothing); the permissionless backstop = anyone.
 
 ---
 
-## 8. Test plan
+## 8. Implementation notes (flag model)
 
-See `docs/specs/ERC8183R1Transitions.t.sol` — a drop-in Foundry suite that encodes the full
-transition matrix (every `state × verb × caller` → outcome or revert), written against the
-**proposed** R1 ABI. It lives under `docs/specs/` (outside the compiled `test/` tree) so this
-spec branch stays green; moving it to `test/` is the first step of an R1 implementation. The
-matrix it encodes is reproduced as a table at the top of that file.
+- **No storage-layout change**: `pendingClaimHash` and `settledAmount` already exist; `JobStatus`
+  is untouched. No migration of in-flight jobs.
+- **Meta-tx (EIP-712):** `reject` keeps a single `RejectAuthorization` typehash now including
+  `claimHash`. A signed `reject` is deterministic per (signer, claimHash): a stale-state cancel
+  fails closed (hash mismatch); a `claimHash==0` terminate is gated by auth+status at execution.
+- **Effects before interactions**: clear the flag / advance `settledAmount` / set terminal status
+  *before* any token transfer, disburser callback, or `_afterHook`. The `settle` auto-void deletes
+  the flag in the effects block, before payout — no new reentrancy surface.
+- **Events**: keep a clean monotonic claim lifecycle — `ClaimSubmitted → (ClaimApproved | ClaimRejected | ClaimSettled)`;
+  `settle` overtake and terminal teardown both emit `ClaimRejected` so indexers see the claim close.
+
+---
+
+## 9. Test plan
+
+See `docs/specs/ERC8183R1Transitions.t.sol` — a drop-in Foundry suite encoding the full
+`state × verb × caller` matrix against this model, including the **TOCTOU/front-run test**
+(a non-zero-`claimHash` cancel against a vanished claim reverts and does NOT terminate) and the
+status-validation reverts. It lives under `docs/specs/` (outside the compiled `test/` tree) so
+this spec branch stays green; `git mv` it into `test/` as the first step of an implementation.
