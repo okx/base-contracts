@@ -89,7 +89,7 @@ every exit from Funded clears pendingClaimHash before/at the status change (no c
    void claim + refund        │              │   ▲           ▼                     │
    ───────────────────────────┘              │   └───────────┐                     │
                                              │   settle/release (resolve)          │
-   Funded[flag] ── settle [client] ──► advance cursor; AUTO-VOID claim if overtaken; drain→Completed
+   Funded[flag] ── settle [client] ──► advance cursor; drain→Completed (voids claim); partial overtake LEAVES claim (lazy)
    Funded[flag] ── release(match) [client|eval] ──► approve; clear flag; drain→Completed else →Funded
    Funded[flag] ── reject(hash) [prov|client|eval] ──► clear flag → Funded ───────────┘
    Funded[flag] ── reject(0) [evaluator] ──► void claim + refund → Rejected
