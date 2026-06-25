@@ -1085,7 +1085,13 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         uint256 remainder = job.budget - job.settledAmount;
         if (toProvider) {
             job.status = JobStatus.Completed;
-            if (remainder > 0) _distributeSettlement(jobId, job, remainder, selector, optParams);
+            if (remainder > 0) {
+                // Advance the cursor to budget so a Completed job reports settledAmount == budget
+                // (the provider has now received the full escrow). Effects before the payout.
+                job.settledAmount = job.budget;
+                emit Settled(jobId, job.budget, remainder);
+                _distributeSettlement(jobId, job, remainder, selector, optParams);
+            }
             emit JobCompleted(jobId, actor, reason);
         } else {
             job.status = JobStatus.Rejected;

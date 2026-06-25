@@ -1129,7 +1129,8 @@ contract ERC8183Test is Test {
         core.release(jobId, TWENTY_USDC, bytes32("ok"), "");
 
         assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Completed));
-        assertEq(core.getJob(jobId).settledAmount, 0);
+        // final release advances the cursor to budget (Completed => settledAmount == budget)
+        assertEq(core.getJob(jobId).settledAmount, TWENTY_USDC);
         assertEq(usdc.balanceOf(provider), TWENTY_USDC);
         assertEq(usdc.balanceOf(address(core)), 0);
     }
@@ -1147,7 +1148,9 @@ contract ERC8183Test is Test {
         core.release(jobId, TWENTY_USDC, bytes32("ok"), "");
 
         assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Completed));
-        assertEq(core.getJob(jobId).settledAmount, TEN_USDC);
+        // final release advances the cursor to budget (Completed => settledAmount == budget);
+        // the provider was still paid only the unsettled remainder (10 + 10 = 20 total, not 30).
+        assertEq(core.getJob(jobId).settledAmount, TWENTY_USDC);
         assertEq(usdc.balanceOf(provider), TWENTY_USDC);
         assertEq(usdc.balanceOf(address(core)), 0);
     }

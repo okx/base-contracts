@@ -36,8 +36,8 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
-import {ERC8183} from "../../contracts/ERC8183.sol";
-import {MockUSDC} from "../../contracts/mocks/MockUSDC.sol";
+import {ERC8183} from "../contracts/ERC8183.sol";
+import {MockUSDC} from "../contracts/mocks/MockUSDC.sol";
 
 contract ERC8183TransitionsTest is Test {
     uint256 constant BUDGET = 20_000_000; // 20 USDC
