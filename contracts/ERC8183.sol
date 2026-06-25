@@ -1039,9 +1039,12 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
 
     /// @dev Shared settlement engine for the direct path (`settle`) and the attested
     ///      path (`release` approving a pending claim). Advances the ledger, distributes
-    ///      the delta, and reports whether the escrow is now fully drained. Callers emit
-    ///      their own path-specific event (ClaimSettled / ClaimApproved) and then, if
-    ///      drained, call _terminalizeOnDrain to project the lifecycle onto Completed.
+    ///      the delta, and reports whether the escrow is now fully drained. When the
+    ///      settlement drains the escrow it sets the job to Completed BEFORE the payout, so
+    ///      a disburser callback (onDisbursement) observing getJob() during the transfer
+    ///      sees the final Completed status — never a fully-paid-but-Funded job. Callers
+    ///      still emit their path-specific event and, if drained, call _terminalizeOnDrain
+    ///      for the JobCompleted event.
     function _applySettlement(
         uint256 jobId,
         Job storage job,
@@ -1051,17 +1054,21 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         bytes calldata optParams
     ) internal returns (bool drained) {
         job.settledAmount = cumulativeAmount;
+        drained = cumulativeAmount == job.budget;
+        // Terminalize before the payout/callback (effects before interactions, and a
+        // consistent lifecycle at the externally-observable disburser integration point).
+        if (drained) job.status = JobStatus.Completed;
         _distributeSettlement(jobId, job, delta, selector, optParams);
         emit Settled(jobId, cumulativeAmount, delta);
-        return cumulativeAmount == job.budget;
     }
 
-    /// @dev Universal terminal projection: when a settlement drains the escrow
-    ///      (settledAmount == budget) the job is economically closed, so its status
-    ///      follows the ledger to Completed. `actor` is whoever drained the escrow; a
-    ///      client `settle` carries no evaluator attestation, hence the sentinel reason.
-    ///      Invariant: callers reach here with no pending claim — `settle` requires the
-    ///      slot empty, and `release`'s approve path deletes the claim before draining.
+    /// @dev Universal terminal projection: when a settlement drains the escrow the job is
+    ///      economically closed. The Completed status is set inside _applySettlement (before
+    ///      the payout, so callbacks see it); this emits the JobCompleted lifecycle event.
+    ///      The status write here is an idempotent backstop. `actor` is whoever drained the
+    ///      escrow; a client `settle` carries no evaluator attestation, hence the sentinel
+    ///      reason. Invariant: callers reach here with no pending claim — `settle` clears any
+    ///      claim when draining, and `release`'s approve path deletes the claim before draining.
     function _terminalizeOnDrain(uint256 jobId, Job storage job, address actor) internal {
         job.status = JobStatus.Completed;
         emit JobCompleted(jobId, actor, bytes32("settled-in-full"));

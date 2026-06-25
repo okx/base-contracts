@@ -35,9 +35,32 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
 import {ERC8183} from "../contracts/ERC8183.sol";
+import {IDisburser} from "../contracts/IDisburser.sol";
 import {MockUSDC} from "../contracts/mocks/MockUSDC.sol";
+
+/// @notice Payout receiver that records the job status it observes DURING onDisbursement,
+///         to prove a draining settle terminalizes (Completed) BEFORE the payout callback.
+contract CompletionObserverDisburser is IDisburser {
+    ERC8183 public core;
+    uint8 public observedStatus;
+    bool public called;
+
+    constructor(ERC8183 _core) {
+        core = _core;
+    }
+
+    function onDisbursement(uint256 jobId, bytes4, address, uint256, bytes calldata) external override {
+        observedStatus = uint8(core.getJob(jobId).status);
+        called = true;
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IDisburser).interfaceId || interfaceId == type(IERC165).interfaceId;
+    }
+}
 
 contract ERC8183TransitionsTest is Test {
     uint256 constant BUDGET = 20_000_000; // 20 USDC
@@ -302,6 +325,29 @@ contract ERC8183TransitionsTest is Test {
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Expired));
         assertEq(core.pendingClaimHash(jobId), bytes32(0));
         assertEq(usdc.balanceOf(client), bal + BUDGET);
+    }
+
+    // ── drain terminalizes BEFORE the payout callback (review fix) ───────────────
+
+    /// @dev A draining settle must set Completed before invoking the disburser callback, so
+    ///      the callback never observes a fully-paid-but-Funded job. Locks the P2 review fix.
+    function test_settle_drain_disburserObservesCompleted() public {
+        CompletionObserverDisburser disburser = new CompletionObserverDisburser(core);
+        vm.prank(client);
+        uint256 jobId = core.createJob(provider, evaluator, uint48(block.timestamp + 3600), "job", address(0), 0);
+        vm.prank(provider);
+        core.setPayoutReceiver(jobId, address(disburser));
+        vm.prank(provider);
+        core.setBudget(jobId, address(usdc), BUDGET, "");
+        vm.prank(client);
+        core.fund(jobId, address(usdc), BUDGET, "");
+
+        vm.prank(client);
+        core.settle(jobId, BUDGET, bytes32("pay-all"), ""); // drains -> Completed
+
+        assertTrue(disburser.called(), "disburser callback fired");
+        assertEq(disburser.observedStatus(), uint8(ERC8183.JobStatus.Completed), "callback saw Completed, not Funded");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
     }
 
     // ── terminal states are absorbing ────────────────────────────────────────────
