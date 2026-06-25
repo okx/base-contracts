@@ -161,7 +161,7 @@ contract CollapseSettlementFlowTest is Test {
 
     // ── Drain supersedes an unrelated pending claim ───────────────────────────────
 
-    function test_flow_ClearPendingClaimThenDrain() public {
+    function test_flow_SettleDrainsThroughPendingClaim() public {
         uint256 jobId = _createFundedJob(TWENTY_USDC, address(0));
 
         // Provider has an open milestone claim for 10 ...
@@ -170,15 +170,10 @@ contract CollapseSettlementFlowTest is Test {
         bytes32 claimHash = core.pendingClaimHash(jobId);
         assertTrue(claimHash != bytes32(0), "claim pending");
 
-        // ... the client cannot settle around it: settle reverts while a claim stands.
-        vm.expectRevert(ERC8183.PendingClaimExists.selector);
-        vm.prank(client);
-        core.settle(jobId, TWENTY_USDC, bytes32("final"), "");
-
-        // Clear the claim (claim-scoped reject), then settle the full budget -> Completed.
-        vm.prank(client);
-        core.reject(jobId, claimHash, bytes32("withdrawn"), "");
-
+        // settle is ISOLATED: the client can settle the full budget even while a claim stands.
+        // Draining the escrow completes the job and voids the now-superseded claim.
+        vm.expectEmit(true, true, true, true, address(core));
+        emit ClaimRejected(jobId, client, bytes32("superseded-by-settle"));
         vm.expectEmit(true, true, true, true, address(core));
         emit JobCompleted(jobId, client, bytes32("settled-in-full"));
         vm.prank(client);

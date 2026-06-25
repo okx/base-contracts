@@ -702,11 +702,11 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
     }
 
     /// @notice Provider submits work against a job — the single generic provider entry
-    ///         point. The cumulative amount asserted determines the path:
+    ///         point. Reverts if a milestone claim is already pending (resolve it first).
+    ///         The cumulative amount asserted determines the path:
     ///         - cumulativeAmount == budget is a FINAL delivery: the job moves to
-    ///           Submitted for terminal evaluation (release / reject), and any pending
-    ///           milestone claim is superseded. A zero-budget job (cumulativeAmount == 0)
-    ///           takes this path.
+    ///           Submitted for terminal evaluation (release / reject). A zero-budget job
+    ///           (cumulativeAmount == 0) takes this path.
     ///         - cumulativeAmount < budget files a MILESTONE claim: a pending settlement
     ///           the client or evaluator approves (`release`) or any party cancels via
     ///           `reject` with the claim hash. The job stays Funded so further settlement
@@ -740,17 +740,16 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         ) revert WrongStatus();
         if (job.expiredAt != 0 && block.timestamp >= job.expiredAt) revert WrongStatus();
         if (cumulativeAmount > job.budget) revert ExceedsBudget();
+        // One outstanding provider assertion at a time: a pending milestone claim must be
+        // resolved (release) or cancelled (reject with its hash) before the provider may
+        // file another claim or move to final delivery. This is the "resolve before moving
+        // on" rule — the provider can always self-cancel their own pending claim first.
+        if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
 
         if (cumulativeAmount == job.budget) {
             // FINAL delivery: assert the full escrow for terminal evaluation.
             uint256 delta = cumulativeAmount - job.settledAmount;
             bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
-            if (pendingClaimHash[jobId] != bytes32(0)) {
-                // Final submit supersedes any pending milestone claim: the provider is
-                // moving to the normal completion path for the full remaining escrow.
-                delete pendingClaimHash[jobId];
-                emit ClaimRejected(jobId, actor, bytes32("superseded-by-submit"));
-            }
             _beforeHook(job.hook, jobId, this.submit.selector, data);
 
             job.status = JobStatus.Submitted;
@@ -763,7 +762,6 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             // MILESTONE claim: a pending settlement for part of the budget.
             if (job.status != JobStatus.Funded) revert WrongStatus();
             if (deliverable == bytes32(0)) revert EmptyDeliverable();
-            if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
             if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
 
             uint256 delta = cumulativeAmount - job.settledAmount;
@@ -784,8 +782,11 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
     ///         ONLY: the evaluator may resolve a provider assertion via `release`, but
     ///         may never originate a payment on a bare Funded job (the client funded it,
     ///         only the client may voluntarily pay out without a provider assertion).
-    ///         Valid only on a Funded job with NO pending claim — honour a standing claim
-    ///         via `release`/`reject` first. Draining the escrow completes the job.
+    ///         ISOLATED from the claim flow: a pending milestone claim does NOT block
+    ///         settle — the monotonic settledAmount cursor prevents any double-payment.
+    ///         A settle that drains the escrow completes the job and voids any pending
+    ///         claim; a partial settle that overtakes a pending claim leaves it in place
+    ///         (it becomes un-approvable and is cleared lazily via reject/terminate/expiry).
     /// @param jobId The job to settle against
     /// @param cumulativeAmount Cumulative amount to settle to (must be <= budget)
     /// @param deliverable Client's settlement attestation / memo
@@ -810,7 +811,8 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
         if (actor != job.client) revert Unauthorized();
         if (job.status != JobStatus.Funded) revert WrongStatus();
-        if (pendingClaimHash[jobId] != bytes32(0)) revert PendingClaimExists();
+        // NOTE: settle is intentionally NOT gated on pendingClaimHash — it is isolated from
+        // the claim flow. Monotonic settledAmount is the double-payment defense.
         if (block.timestamp >= job.expiredAt) revert WrongStatus();
         if (cumulativeAmount <= job.settledAmount) revert NoNewSettlement();
         if (cumulativeAmount > job.budget) revert ExceedsBudget();
@@ -818,6 +820,13 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         uint256 delta = cumulativeAmount - job.settledAmount;
         bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
         _beforeHook(job.hook, jobId, this.settle.selector, data);
+
+        // A completed job carries no pending claim: if this settle drains the escrow, void
+        // any pending claim BEFORE the payout (effects-before-interactions).
+        if (cumulativeAmount == job.budget && pendingClaimHash[jobId] != bytes32(0)) {
+            delete pendingClaimHash[jobId];
+            emit ClaimRejected(jobId, actor, bytes32("superseded-by-settle"));
+        }
 
         bool drained = _applySettlement(jobId, job, cumulativeAmount, delta, this.settle.selector, optParams);
         emit ClaimSettled(jobId, actor, cumulativeAmount, delta, deliverable);
@@ -968,22 +977,29 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         _afterHook(job.hook, jobId, this.reject.selector, data);
     }
 
-    /// @notice Claims a refund for an expired job. Anyone can call.
-    ///         Transitions Open/Funded/Submitted -> Expired after expiry time.
-    ///         Not hookable; pending claims must still be resolved before refund.
+    /// @notice Claims a refund for an expired job. Anyone can call — the permissionless
+    ///         anti-stale backstop. Transitions Open/Funded/Submitted -> Expired after the
+    ///         expiry time (Submitted: after the evaluation grace period). A pending
+    ///         milestone claim does NOT block the refund: it is voided here, so a job can
+    ///         never be permanently stalled by an unresolved claim. Not hookable, so no
+    ///         reverting hook can strand the escrow.
     /// @param jobId The expired job to claim refund for
     function claimRefund(uint256 jobId) external whenNotPaused nonReentrant {
         Job storage job = jobs[jobId];
         if (jobId == 0 || jobId > jobCounter) revert InvalidJob();
         if (job.status != JobStatus.Open && job.status != JobStatus.Funded && job.status != JobStatus.Submitted)
             revert WrongStatus();
-        bool hasPendingClaim = pendingClaimHash[jobId] != bytes32(0);
         if (job.status == JobStatus.Submitted) {
             if (block.timestamp < job.expiredAt + EVALUATION_GRACE_PERIOD) revert GracePeriodActive();
-        } else if (hasPendingClaim) {
-            revert PendingClaimExists();
         } else {
             if (block.timestamp < job.expiredAt) revert WrongStatus();
+        }
+
+        // Permissionless anti-stale: void any pending claim rather than reverting on it, so
+        // an unresolved claim can never block the expiry refund. Effects before interactions.
+        if (pendingClaimHash[jobId] != bytes32(0)) {
+            delete pendingClaimHash[jobId];
+            emit ClaimRejected(jobId, msg.sender, bytes32("expired-refund"));
         }
 
         JobStatus prev = job.status;

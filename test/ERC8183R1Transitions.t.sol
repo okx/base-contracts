@@ -93,9 +93,8 @@ contract ERC8183TransitionsTest is Test {
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Submitted));
     }
 
-    // NB: adapt the destructure arity to the real Job getter at implementation time.
-    function _status(uint256 jobId) internal view returns (ERC8183.JobStatus status) {
-        (, status,,,,,,,,,,,) = core.jobs(jobId);
+    function _status(uint256 jobId) internal view returns (ERC8183.JobStatus) {
+        return core.getJob(jobId).status;
     }
 
     // ── reject(hash): CANCEL a claim, job moves on ───────────────────────────────
@@ -224,12 +223,25 @@ contract ERC8183TransitionsTest is Test {
         assertTrue(core.pendingClaimHash(jobId) != bytes32(0), "sub-claim settle leaves claim pending");
     }
 
-    function test_settle_overtakesClaim_autoVoids() public {
-        (uint256 jobId,) = _claimPending(); // claim at HALF
+    /// @dev A non-draining settle that overtakes a claim leaves it pending (lazy cleanup):
+    ///      it becomes un-approvable (release reverts) and is cleared via reject/terminate/expiry.
+    function test_settle_overtakesClaim_leavesStale_lazyCleanup() public {
+        (uint256 jobId, bytes32 h) = _claimPending(); // claim at HALF, deliverable "m1"
         vm.prank(client);
-        core.settle(jobId, HALF + 1, bytes32("memo"), ""); // overtakes the claim
-        assertEq(core.pendingClaimHash(jobId), bytes32(0), "overtaken claim auto-voided");
+        core.settle(jobId, HALF + 1, bytes32("memo"), ""); // overtakes the claim (partial, < budget)
+
+        assertTrue(core.pendingClaimHash(jobId) != bytes32(0), "claim lingers (lazy cleanup)");
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded));
+
+        // the overtaken claim is now un-approvable
+        vm.expectRevert(ERC8183.NoNewSettlement.selector);
+        vm.prank(evaluator);
+        core.release(jobId, HALF, bytes32("m1"), "");
+
+        // and is cleared via reject(hash)
+        vm.prank(provider);
+        core.reject(jobId, h, bytes32("cleanup"), "");
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
     }
 
     function test_settle_drainsWhilePending_completes_voidsClaim() public {

@@ -1,7 +1,9 @@
 # ERC-8183 — Settlement State-Transition Spec (converged)
 
-**Status:** design proposal, not implemented. This branch carries the spec and a drop-in
-transition test plan only.
+**Status:** IMPLEMENTED on this branch (`experiment/collapse-flag-model`). The contract changes
+(isolated `settle`, `submit` blocked while a claim pends, `reject(claimHash)` with the front-run
+guard, `claimRefund` voids stale claims) are live in `contracts/ERC8183.sol`; the transition
+suite is `test/ERC8183R1Transitions.t.sol`. Full suite: 105 passing.
 **Builds on:** `experiment/collapse-settlement-flow` (the 8→5 verb collapse). This spec keeps
 that collapsed 5-verb surface and specifies how the *pending-claim* sub-state transitions,
 who is authorized, and how DoS / front-running is prevented.
@@ -104,12 +106,14 @@ every exit from Funded clears pendingClaimHash before/at the status change (no c
 cursor** — it does **not** read the pending-claim flag and is never gated by it.
 
 - `settle(Y)` pays `delta = Y − settledAmount`, sets `settledAmount = Y`.
-- **Overtake rule:** if `Y ≥ the pending claim's cumulativeAmount`, the claim is now
-  satisfied-or-exceeded and un-approvable; `settle` **auto-voids** it (delete the flag, emit
-  `ClaimRejected("overtaken")`). This is the *only* place `settle` touches the claim, and it is
-  in service of not stranding a now-dead claim.
-- **Drain rule:** if `Y == budget`, the job completes (`→ Completed`), voiding any pending claim
-  first.
+- **Drain rule:** if `Y == budget`, the job completes (`→ Completed`) and voids any pending claim
+  first (a completed job carries no claim).
+- **Overtake (lazy cleanup):** a *partial* settle that passes a claim's amount leaves the claim
+  in place. It is now un-approvable (`release` reverts `NoNewSettlement` since
+  `claim.cumulative ≤ settledAmount`) and is cleared lazily on the next `reject`/`terminate`/
+  `claimRefund`. We deliberately do **not** store the claim amount just to auto-void here —
+  keeping `settle` storage-free and fully uncoupled from the claim. A lingering claim blocks only
+  the provider's own next `submit` (self-inflicted; they cancel it).
 
 **Safety (why coexistence is sound):** both `settle` and an approved `release` only ever pay
 `delta` above the monotonic `settledAmount`, and `release` of a claim requires
