@@ -872,13 +872,8 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         if (actor != job.client && actor != job.evaluator) revert Unauthorized();
 
         if (job.status == JobStatus.Submitted) {
-            // Final-delivery completion is EVALUATOR-ONLY: a neutral arbiter gates the final
-            // payment on a submitted delivery. (The client may pay pre-submission via `settle`,
-            // and either party may approve a milestone claim below, but only the evaluator
-            // finalizes a Submitted job.)
-            if (actor != job.evaluator) revert Unauthorized();
-            // Release the full remaining escrow to the provider; must specify the full budget
-            // (both over- and under-specifying revert).
+            // Final-delivery completion: release the full remaining escrow to the provider.
+            // The release must specify the full budget (both over- and under-specifying revert).
             if (cumulativeAmount != job.budget) revert MustReleaseFullBudget();
             bytes memory data =
                 abi.encode(actor, cumulativeAmount, job.budget - job.settledAmount, deliverable, optParams);
