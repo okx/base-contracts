@@ -314,11 +314,19 @@ contract ERC8183TransitionsTest is Test {
         core.release(jobId, HALF, bytes32("partial"), ""); // under-specifies the final release
     }
 
-    function test_release_submitted_byClient_completes() public {
+    function test_release_submitted_byEvaluator_completes() public {
         uint256 jobId = _submitted();
-        vm.prank(client);
+        vm.prank(evaluator);
         core.release(jobId, BUDGET, bytes32("ok"), "");
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Completed));
+    }
+
+    /// @dev Final-delivery completion is evaluator-only: the client may NOT finalize a Submitted job.
+    function test_release_submitted_byClient_revertsUnauthorized() public {
+        uint256 jobId = _submitted();
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(client);
+        core.release(jobId, BUDGET, bytes32("ok"), "");
     }
 
     // ── claimRefund: permissionless anti-stale backstop ──────────────────────────
