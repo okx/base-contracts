@@ -25,7 +25,7 @@ submit · settle · release · reject · claimRefund
 |---|---|---|
 | `submit(jobId, cumulativeAmount, deliverable, optParams)` | provider | `== budget` → final delivery (Submitted); `< budget` → files a pending milestone claim |
 | `settle(jobId, cumulativeAmount, deliverable, optParams)` | client | **isolated** direct payment; pure cursor op (see §4) |
-| `release(jobId, cumulativeAmount, deliverable, optParams)` | client \| evaluator | resolve a standing assertion (approve a claim, or complete a Submitted delivery) |
+| `release(jobId, cumulativeAmount, deliverable, optParams)` | client \| evaluator to approve a claim; **evaluator only** to complete a Submitted delivery | resolve a standing assertion: either party approves a pending milestone claim, but only the evaluator finalizes a Submitted final delivery |
 | `reject(jobId, claimHash, reason, optParams)` | scoped (see §5) | `claimHash != 0` cancels that exact claim (job continues); `claimHash == 0` terminates the job |
 | `claimRefund(jobId)` | anyone | post-expiry backstop; voids any stale claim + refunds remainder |
 
@@ -93,7 +93,7 @@ every exit from Funded clears pendingClaimHash before/at the status change (no c
    Funded[flag] ── release(match) [client|eval] ──► approve; clear flag; drain→Completed else →Funded
    Funded[flag] ── reject(hash) [prov|client|eval] ──► clear flag → Funded ───────────┘
    Funded[flag] ── reject(0) [evaluator] ──► void claim + refund → Rejected
-   Submitted ── release(=budget) [client|eval] ──► Completed
+   Submitted ── release(=budget) [evaluator only] ──► Completed
    Submitted ── reject(0) [evaluator] ──► refund → Rejected
    {Open(b>0),Funded[±flag],Submitted} ── claimRefund (anyone, post-expiry) ──► void any claim + refund → Expired
 ```
@@ -208,7 +208,8 @@ the claim `release`d before expiry. This sits alongside the `reject(0)` residual
 |---|---|---|---|---|
 | `submit` (file claim / deliver) | ✅ | — | — | — |
 | `settle` (originate payment) | — | ✅ | — | — |
-| `release` (resolve standing assertion) | — | ✅ | ✅ | — |
+| `release` — approve a pending milestone claim | — | ✅ | ✅ | — |
+| `release` — complete a Submitted final delivery | — | — | ✅ | — |
 | `reject(hash)` (cancel a claim) | ✅ | ✅ | ✅ | — |
 | `reject(0)` on Open (terminate, no escrow) | ✅ | ✅ | — | — |
 | `reject(0)` on Funded/Submitted (terminate + refund) | — | — | ✅ | — |
@@ -233,10 +234,11 @@ cancel-a-claim = anyone party (safe, strands nothing); the permissionless backst
   `settle` overtake and terminal teardown both emit `ClaimRejected` so indexers see the claim close.
 - **`JobCompleted` no longer implies evaluator attestation** (integrator-facing change). A client
   `settle` that drains the budget emits `JobCompleted(reason: "settled-in-full")` with the **client**
-  as `actor` and no evaluator sign-off, and a client `release` can complete a `Submitted` job (see the
-  trust-model note below). Indexers/integrations that previously read `JobCompleted` as "the evaluator
-  approved" must instead key off `reason`/`actor` (or the `ClaimApproved` vs `ClaimSettled` event) to
-  distinguish evaluator-attested completion from a client-direct payout.
+  as `actor` and no evaluator sign-off. (Completing a *Submitted* final delivery via `release` is
+  evaluator-only — see §1/§7 — but a client-direct `settle` can still drive a job to Completed.)
+  Indexers/integrations that previously read `JobCompleted` as "the evaluator approved" must instead
+  key off `reason`/`actor` (or the `ClaimApproved` vs `ClaimSettled` event) to distinguish
+  evaluator-attested completion from a client-direct payout.
 
 ---
 
