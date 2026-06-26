@@ -193,6 +193,13 @@ Liveness across abandonment (no funds ever permanently stranded):
 A pending claim blocks **nothing a counterparty needs** — only the provider's own next `submit`
 (self-inflicted). That is what defeats intentional staling.
 
+**Post-expiry order-dependence (benign, by design).** `release` is intentionally not expiry-gated
+(a filed claim stays resolvable after expiry), so after expiry a pending claim can resolve **either**
+way depending on tx ordering between two legitimate parties: the evaluator/client `release`s it
+(pays the provider) **or** anyone `claimRefund`s (voids it, refunds the client). No funds are lost
+on either branch — the outcome is just whichever lands first. The provider's protection is to get
+the claim `release`d before expiry. This sits alongside the `reject(0)` residual in §5.
+
 ---
 
 ## 7. Authorization summary
@@ -224,6 +231,12 @@ cancel-a-claim = anyone party (safe, strands nothing); the permissionless backst
   the flag in the effects block, before payout — no new reentrancy surface.
 - **Events**: keep a clean monotonic claim lifecycle — `ClaimSubmitted → (ClaimApproved | ClaimRejected | ClaimSettled)`;
   `settle` overtake and terminal teardown both emit `ClaimRejected` so indexers see the claim close.
+- **`JobCompleted` no longer implies evaluator attestation** (integrator-facing change). A client
+  `settle` that drains the budget emits `JobCompleted(reason: "settled-in-full")` with the **client**
+  as `actor` and no evaluator sign-off, and a client `release` can complete a `Submitted` job (see the
+  trust-model note below). Indexers/integrations that previously read `JobCompleted` as "the evaluator
+  approved" must instead key off `reason`/`actor` (or the `ClaimApproved` vs `ClaimSettled` event) to
+  distinguish evaluator-attested completion from a client-direct payout.
 
 ---
 

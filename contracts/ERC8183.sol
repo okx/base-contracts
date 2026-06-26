@@ -295,6 +295,9 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
     error NoNewSettlement();
     /// @notice Thrown when cumulative settlement would exceed the job budget
     error ExceedsBudget();
+    /// @notice Thrown when releasing a Submitted (final-delivery) job with anything other than
+    ///         the full budget — the final release must drain the whole escrow to the provider.
+    error MustReleaseFullBudget();
     /// @notice Thrown when submitting a nonzero-deliverable claim hash that was already submitted
     error ClaimAlreadySubmitted();
     /// @notice Thrown when submitting a provider claim without a deliverable
@@ -870,7 +873,8 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
 
         if (job.status == JobStatus.Submitted) {
             // Final-delivery completion: release the full remaining escrow to the provider.
-            if (cumulativeAmount != job.budget) revert ExceedsBudget();
+            // The release must specify the full budget (both over- and under-specifying revert).
+            if (cumulativeAmount != job.budget) revert MustReleaseFullBudget();
             bytes memory data =
                 abi.encode(actor, cumulativeAmount, job.budget - job.settledAmount, deliverable, optParams);
             _beforeHook(job.hook, jobId, this.release.selector, data);

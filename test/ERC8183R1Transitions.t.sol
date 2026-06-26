@@ -307,6 +307,13 @@ contract ERC8183TransitionsTest is Test {
         core.release(jobId, HALF, bytes32("x"), "");
     }
 
+    function test_release_submitted_partialAmount_revertsMustReleaseFullBudget() public {
+        uint256 jobId = _submitted();
+        vm.expectRevert(ERC8183.MustReleaseFullBudget.selector);
+        vm.prank(evaluator);
+        core.release(jobId, HALF, bytes32("partial"), ""); // under-specifies the final release
+    }
+
     function test_release_submitted_byClient_completes() public {
         uint256 jobId = _submitted();
         vm.prank(client);
