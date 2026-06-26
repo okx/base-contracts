@@ -136,6 +136,19 @@ contract ERC8183Test is Test {
         core.submit(jobId, TWENTY_USDC, bytes32("done"), "");
     }
 
+    function test_release_submittedCompletion_isEvaluatorOnly() public {
+        uint256 jobId = _createSubmittedJob(address(0));
+        // client may NOT finalize a Submitted delivery (evaluator-only completion)
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(client);
+        core.release(jobId, TWENTY_USDC, bytes32("ok"), "");
+
+        // evaluator can
+        vm.prank(evaluator);
+        core.release(jobId, TWENTY_USDC, bytes32("ok"), "");
+        assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Completed));
+    }
+
     function _claimBindingHash(uint256 amount, bytes32 deliverable, bytes memory optParams)
         internal
         pure
