@@ -886,11 +886,11 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             // Final-delivery completion: release the full remaining escrow to the provider;
             // must specify the full budget (both over- and under-specifying revert).
             if (cumulativeAmount != job.budget) revert MustReleaseFullBudget();
-            bytes memory data =
+            bytes memory finalReleaseData =
                 abi.encode(actor, cumulativeAmount, job.budget - job.settledAmount, deliverable, optParams);
-            _beforeHook(job.hook, jobId, this.release.selector, data);
+            _beforeHook(job.hook, jobId, this.release.selector, finalReleaseData);
             _finalize(actor, jobId, job, true, true, deliverable, this.release.selector, optParams);
-            _afterHook(job.hook, jobId, this.release.selector, data);
+            _afterHook(job.hook, jobId, this.release.selector, finalReleaseData);
             return;
         }
 
@@ -908,15 +908,15 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
         if (cumulativeAmount > job.budget) revert ExceedsBudget();
 
         uint256 delta = cumulativeAmount - job.settledAmount;
-        bytes memory data = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
-        _beforeHook(job.hook, jobId, this.release.selector, data);
+        bytes memory releaseData = abi.encode(actor, cumulativeAmount, delta, deliverable, optParams);
+        _beforeHook(job.hook, jobId, this.release.selector, releaseData);
 
         delete pendingClaimHash[jobId];
         bool drained = _applySettlement(jobId, job, cumulativeAmount, delta, this.release.selector, optParams);
         emit ClaimApproved(jobId, actor, cumulativeAmount, delta, deliverable);
         if (drained) _terminalizeOnDrain(jobId, job, actor);
 
-        _afterHook(job.hook, jobId, this.release.selector, data);
+        _afterHook(job.hook, jobId, this.release.selector, releaseData);
     }
 
     /// @notice Rejects either a single pending claim (non-terminal) or the whole job
@@ -956,11 +956,11 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             // The provider may self-cancel a stale claim to unblock a corrected one.
             if (actor != job.client && actor != job.evaluator && actor != job.provider) revert Unauthorized();
 
-            bytes memory data = abi.encode(actor, claimHash, reason, optParams);
-            _beforeHook(job.hook, jobId, this.reject.selector, data);
+            bytes memory claimRejectData = abi.encode(actor, claimHash, reason, optParams);
+            _beforeHook(job.hook, jobId, this.reject.selector, claimRejectData);
             delete pendingClaimHash[jobId];
             emit ClaimRejected(jobId, actor, reason);
-            _afterHook(job.hook, jobId, this.reject.selector, data);
+            _afterHook(job.hook, jobId, this.reject.selector, claimRejectData);
             return;
         }
 
@@ -975,7 +975,7 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             revert WrongStatus();
         }
 
-        bytes memory data = abi.encode(actor, bytes32(0), reason, optParams);
+        bytes memory jobRejectData = abi.encode(actor, bytes32(0), reason, optParams);
         if (pendingClaimHash[jobId] != bytes32(0)) {
             // Terminal job rejection also rejects any pending milestone claim, so
             // hooks and indexers observe a closed claim lifecycle.
@@ -983,13 +983,13 @@ contract ERC8183 is Initializable, AccessControlUpgradeable, PausableUpgradeable
             emit ClaimRejected(jobId, actor, reason);
         }
         bool refundEligible = (job.status == JobStatus.Funded || job.status == JobStatus.Submitted);
-        _beforeHook(job.hook, jobId, this.reject.selector, data);
+        _beforeHook(job.hook, jobId, this.reject.selector, jobRejectData);
 
         // reject is the toClient direction of the shared terminal release: it refunds the
         // unsettled remainder (when escrow was locked) and moves the job to Rejected.
         _finalize(actor, jobId, job, false, refundEligible, reason, this.reject.selector, optParams);
 
-        _afterHook(job.hook, jobId, this.reject.selector, data);
+        _afterHook(job.hook, jobId, this.reject.selector, jobRejectData);
     }
 
     /// @notice Claims a refund for an expired job. Anyone can call. Transitions
