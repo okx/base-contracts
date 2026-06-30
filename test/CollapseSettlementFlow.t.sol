@@ -240,7 +240,9 @@ contract CollapseSettlementFlowTest is Test {
     }
 
     /// @dev `release` only resolves a STANDING assertion; with no pending claim (and not
-    ///      Submitted) there is nothing to approve, so it reverts — even for the client.
+    ///      Submitted) the authorized caller (evaluator) reverts NoPendingClaim. The client
+    ///      cannot release at all — release is evaluator-only — so it reverts Unauthorized
+    ///      before the claim is even inspected.
     function test_security_ReleaseRevertsWithNoStandingClaim() public {
         uint256 jobId = _createFundedJob(TWENTY_USDC, address(0));
 
@@ -248,7 +250,7 @@ contract CollapseSettlementFlowTest is Test {
         vm.prank(evaluator);
         core.release(jobId, TEN_USDC, bytes32("x"), "");
 
-        vm.expectRevert(ERC8183.NoPendingClaim.selector);
+        vm.expectRevert(ERC8183.Unauthorized.selector);
         vm.prank(client);
         core.release(jobId, TEN_USDC, bytes32("x"), "");
     }

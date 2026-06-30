@@ -15,20 +15,20 @@ pragma solidity ^0.8.28;
 //                        job stays Funded ("moves on").
 //       claimHash == 0 → TERMINATE: Open → client|provider; Funded/Submitted → evaluator only;
 //                        voids any pending claim + refunds remainder → Rejected.
-//   • claimRefund: permissionless post-expiry; voids any pending claim + refunds → Expired.
+//   • claimRefund: permissionless post-expiry; BLOCKED by a pending claim (resolve first) → Expired.
 //
 // Lives under docs/specs/ (outside foundry's `test` path) so the spec branch stays green; it
 // asserts the PROPOSED behaviour (e.g. settle-not-gated, reject front-run guard) which differs
 // from the current collapse branch. `git mv` into test/ as step one of the implementation.
 //
 // ── Transition matrix encoded ────────────────────────────────────────────────
-//  state[flag] \ verb │ submit             │ settle (client)        │ release (cli|eval)   │ reject(hash) (any party) │ reject(0)                    │ claimRefund (anyone)
+//  state[flag] \ verb │ submit             │ settle (client)        │ release (eval only)  │ reject(hash) (any party) │ reject(0)                    │ claimRefund (anyone)
 //  ───────────────────┼────────────────────┼────────────────────────┼──────────────────────┼──────────────────────────┼──────────────────────────────┼─────────────────────
 //  Open(b>0)          │ revert WrongStatus │ revert WrongStatus     │ revert               │ revert WrongStatus       │ client|prov → Rejected       │ post-exp → Expired
 //  Funded[no flag]    │ <bud→set flag      │ advance / drain→Compl  │ revert NoPendingClaim│ revert NoPendingClaim    │ evaluator → Rejected+refund  │ post-exp → Expired
 //                     │ =bud→Submitted     │                        │                      │ (no claim to match)      │ (client/prov → Unauthorized) │
-//  Funded[flag]       │ revert PendingClaim│ advance; AUTO-VOID if  │ match→approve;       │ match→cancel→Funded;     │ evaluator → void+refund→Rej  │ post-exp → void+Expired
-//                     │ (resolve first)    │ overtaken; drain→Compl │ drain→Compl else Fund│ MISMATCH→revert (TOCTOU) │ (client/prov → Unauthorized) │
+//  Funded[flag]       │ =bud→supersede→Subm│ advance; AUTO-VOID if  │ match→approve;       │ match→cancel→Funded;     │ evaluator → void+refund→Rej  │ post-exp → revert PendingClaim
+//                     │ <bud→revert Pending│ overtaken; drain→Compl │ drain→Compl else Fund│ MISMATCH→revert (TOCTOU) │ (client/prov → Unauthorized) │ (resolve first)
 //  Submitted          │ revert WrongStatus │ revert WrongStatus     │ =budget→Completed    │ revert WrongStatus       │ evaluator → Rejected+refund  │ post-grace → Expired
 //  Completed/Rejected/Expired → all revert WrongStatus (terminal/absorbing)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,9 +302,31 @@ contract ERC8183TransitionsTest is Test {
 
     function test_release_onFundedNoClaim_revertsNoPendingClaim() public {
         uint256 jobId = _funded();
+        // The authorized caller (evaluator) still reverts NoPendingClaim when there is no
+        // standing assertion to resolve — release never originates a payment.
         vm.expectRevert(ERC8183.NoPendingClaim.selector);
-        vm.prank(client);
+        vm.prank(evaluator);
         core.release(jobId, HALF, bytes32("x"), "");
+    }
+
+    /// @dev Milestone approval is EVALUATOR-ONLY: the client cannot approve a pending claim
+    ///      via release (it must `settle` to pay directly). Mirrors the Submitted-completion
+    ///      rule — release is wholly an evaluator verb. Reverts before the claim is inspected.
+    function test_release_milestone_byClient_revertsUnauthorized() public {
+        (uint256 jobId,) = _claimPending(); // claim at HALF, deliverable "m1"
+        vm.expectRevert(ERC8183.Unauthorized.selector);
+        vm.prank(client);
+        core.release(jobId, HALF, bytes32("m1"), "");
+    }
+
+    /// @dev The evaluator approves the same pending milestone claim — the happy path.
+    function test_release_milestone_byEvaluator_approves() public {
+        (uint256 jobId,) = _claimPending();
+        vm.prank(evaluator);
+        core.release(jobId, HALF, bytes32("m1"), "");
+        assertEq(core.pendingClaimHash(jobId), bytes32(0), "claim cleared on approve");
+        assertEq(core.getJob(jobId).settledAmount, HALF, "cursor advanced to claim");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Funded), "stays Funded (partial)");
     }
 
     function test_release_submitted_partialAmount_revertsMustReleaseFullBudget() public {
@@ -329,17 +351,47 @@ contract ERC8183TransitionsTest is Test {
         core.release(jobId, BUDGET, bytes32("ok"), "");
     }
 
-    // ── claimRefund: permissionless anti-stale backstop ──────────────────────────
+    // ── claimRefund: permissionless post-expiry refund, BLOCKED by a pending claim ────
 
-    function test_claimRefund_postExpiry_voidsPendingClaim_refunds() public {
-        (uint256 jobId,) = _claimPending();
+    function test_claimRefund_postExpiry_blockedByPendingClaim_thenResolves() public {
+        (uint256 jobId, bytes32 h) = _claimPending();
         vm.warp(block.timestamp + 3601);
+
+        // A pending claim blocks the permissionless refund — it would erase the provider's
+        // standing assertion, so it must be resolved/cancelled first.
+        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        vm.prank(stranger);
+        core.claimRefund(jobId);
+
+        // Any party cancels the claim by hash; then anyone may refund the full budget.
+        vm.prank(provider);
+        core.reject(jobId, h, bytes32("withdraw"), "");
         uint256 bal = usdc.balanceOf(client);
         vm.prank(stranger); // anyone
         core.claimRefund(jobId);
         assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Expired));
         assertEq(core.pendingClaimHash(jobId), bytes32(0));
         assertEq(usdc.balanceOf(client), bal + BUDGET);
+    }
+
+    // ── submit: a FINAL submit supersedes a pending milestone claim ──────────────
+
+    function test_submit_final_supersedesPendingClaim() public {
+        (uint256 jobId,) = _claimPending(); // milestone claim pending at HALF
+        // cumulativeAmount == budget → final delivery; voids the pending claim and moves to Submitted.
+        vm.prank(provider);
+        core.submit(jobId, BUDGET, bytes32("final"), "");
+        assertEq(uint8(_status(jobId)), uint8(ERC8183.JobStatus.Submitted));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0), "pending claim superseded");
+    }
+
+    // ── submit: a MILESTONE submit still reverts while a claim is pending ─────────
+
+    function test_submit_milestone_whilePending_reverts() public {
+        (uint256 jobId,) = _claimPending();
+        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        vm.prank(provider);
+        core.submit(jobId, HALF + 1, bytes32("m2"), "");
     }
 
     // ── drain terminalizes BEFORE the payout callback (review fix) ───────────────

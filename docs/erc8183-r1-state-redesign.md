@@ -1,9 +1,10 @@
 # ERC-8183 — Settlement State-Transition Spec (converged)
 
 **Status:** IMPLEMENTED on this branch (`experiment/collapse-flag-model`). The contract changes
-(isolated `settle`, `submit` blocked while a claim pends, `reject(claimHash)` with the front-run
-guard, `claimRefund` voids stale claims) are live in `contracts/ERC8183.sol`; the transition
-suite is `test/ERC8183R1Transitions.t.sol`. Full suite: 105 passing.
+(isolated `settle`; a final `submit` supersedes a pending claim while a milestone `submit` is
+blocked; `release` is evaluator-only; `reject(claimHash)` with the front-run guard; `claimRefund`
+blocked while a claim pends) are live in `contracts/ERC8183.sol`; the transition suite is
+`test/ERC8183R1Transitions.t.sol`.
 **Builds on:** `experiment/collapse-settlement-flow` (the 8→5 verb collapse). This spec keeps
 that collapsed 5-verb surface and specifies how the *pending-claim* sub-state transitions,
 who is authorized, and how DoS / front-running is prevented.
@@ -25,9 +26,9 @@ submit · settle · release · reject · claimRefund
 |---|---|---|
 | `submit(jobId, cumulativeAmount, deliverable, optParams)` | provider | `== budget` → final delivery (Submitted); `< budget` → files a pending milestone claim |
 | `settle(jobId, cumulativeAmount, deliverable, optParams)` | client | **isolated** direct payment; pure cursor op (see §4) |
-| `release(jobId, cumulativeAmount, deliverable, optParams)` | client \| evaluator to approve a claim; **evaluator only** to complete a Submitted delivery | resolve a standing assertion: either party approves a pending milestone claim, but only the evaluator finalizes a Submitted final delivery |
+| `release(jobId, cumulativeAmount, deliverable, optParams)` | **evaluator only** | resolve a standing assertion — the neutral arbiter approves a pending milestone claim *or* finalizes a Submitted final delivery. The client pays directly via `settle`; it never resolves an assertion. |
 | `reject(jobId, claimHash, reason, optParams)` | scoped (see §5) | `claimHash != 0` cancels that exact claim (job continues); `claimHash == 0` terminates the job |
-| `claimRefund(jobId)` | anyone | post-expiry backstop; voids any stale claim + refunds remainder |
+| `claimRefund(jobId)` | anyone | post-expiry refund; **blocked by a pending claim** (resolve via `release`/`reject` first), then refunds remainder |
 
 ---
 
@@ -83,19 +84,20 @@ every exit from Funded clears pendingClaimHash before/at the status change (no c
            ▼   (no escrow)                   │               │                     │
         ┌────────┐                           │ submit(<bud)  │ submit(=bud)        │ reject(hash)
         │Rejected│ ◄──────────┐              │ [provider]    │ [provider]          │ [prov|client|eval]
-        └────────┘            │              │ set flag      │ (must have NO       │ cancel claim
-              ▲               │              ▼   no flag→set │  pending claim;     │ → clears flag
-   reject(0) [evaluator]      │          Funded[flag]        │  else revert)       │ (job moves on)
+        └────────┘            │              │ set flag      │ (supersedes any     │ cancel claim
+              ▲               │              ▼   no flag→set │  pending claim)     │ → clears flag
+   reject(0) [evaluator]      │          Funded[flag]        │  → Submitted        │ (job moves on)
    void claim + refund        │              │   ▲           ▼                     │
    ───────────────────────────┘              │   └───────────┐                     │
                                              │   settle/release (resolve)          │
    Funded[flag] ── settle [client] ──► advance cursor; drain→Completed (voids claim); partial overtake LEAVES claim (lazy)
-   Funded[flag] ── release(match) [client|eval] ──► approve; clear flag; drain→Completed else →Funded
+   Funded[flag] ── release(match) [evaluator] ──► approve; clear flag; drain→Completed else →Funded
    Funded[flag] ── reject(hash) [prov|client|eval] ──► clear flag → Funded ───────────┘
    Funded[flag] ── reject(0) [evaluator] ──► void claim + refund → Rejected
    Submitted ── release(=budget) [evaluator only] ──► Completed
    Submitted ── reject(0) [evaluator] ──► refund → Rejected
-   {Open(b>0),Funded[±flag],Submitted} ── claimRefund (anyone, post-expiry) ──► void any claim + refund → Expired
+   {Open(b>0),Funded[no flag],Submitted} ── claimRefund (anyone, post-expiry) ──► refund → Expired
+   Funded[flag] ── claimRefund ──► revert PendingClaimExists (resolve the claim first)
 ```
 
 ---
@@ -110,10 +112,11 @@ cursor** — it does **not** read the pending-claim flag and is never gated by i
   first (a completed job carries no claim).
 - **Overtake (lazy cleanup):** a *partial* settle that passes a claim's amount leaves the claim
   in place. It is now un-approvable (`release` reverts `NoNewSettlement` since
-  `claim.cumulative ≤ settledAmount`) and is cleared lazily on the next `reject`/`terminate`/
-  `claimRefund`. We deliberately do **not** store the claim amount just to auto-void here —
-  keeping `settle` storage-free and fully uncoupled from the claim. A lingering claim blocks only
-  the provider's own next `submit` (self-inflicted; they cancel it).
+  `claim.cumulative ≤ settledAmount`) and is cleared explicitly via `reject(hash)` or a
+  terminal `reject(0)`. We deliberately do **not** store the claim amount just to auto-void here —
+  keeping `settle` storage-free and fully uncoupled from the claim. A lingering claim blocks the
+  provider's own next `submit` **and** a post-expiry `claimRefund` (both resolvable by a one-line
+  `reject(hash)` from any of provider/client/evaluator); it never blocks `settle`.
 
 **Safety (why coexistence is sound):** both `settle` and an approved `release` only ever pay
 `delta` above the monotonic `settledAmount`, and `release` of a claim requires
@@ -176,29 +179,38 @@ surface.
 
 ---
 
-## 6. `claimRefund` — permissionless anti-stale backstop
+## 6. `claimRefund` — permissionless post-expiry refund (gated by a pending claim)
 
-Post-expiry (Submitted: post-grace), **anyone** may call `claimRefund`. It **voids any pending
-claim** and refunds the remainder to the client → `Expired`. It is the one non-hookable exit, so
-no reverting `hook` can permanently strand escrow.
+Post-expiry (Submitted: post-grace), **anyone** may call `claimRefund`; it refunds the remainder to
+the client → `Expired`. It is the one non-hookable exit, so no reverting `hook` can strand escrow.
 
-Liveness across abandonment (no funds ever permanently stranded):
-- **provider abandons** (claim filed, vanishes): client `settle`s around it (isolated) or
-  evaluator `release`s/`reject(0)`s; post-expiry anyone `claimRefund`s.
-- **client abandons**: evaluator `release`s (pay provider) or `reject(0)`s (refund); post-expiry
-  `claimRefund`.
-- **evaluator abandons**: client/provider can still cancel a claim and the client can `settle`;
-  the remainder is recovered post-expiry by the permissionless `claimRefund`.
+**A pending claim BLOCKS the refund** (`PendingClaimExists`). A refund moves escrow *away* from the
+provider and would erase a standing provider assertion, so — unlike `settle`, which only moves
+escrow *toward* the provider and is therefore safe to isolate — the permissionless refund is gated
+until the claim is resolved (`release`, pay the provider) or cancelled (`reject(hash)`, callable by
+any of provider/client/evaluator). This protects a provider's filed claim from being wiped by a
+third-party refund call.
 
-A pending claim blocks **nothing a counterparty needs** — only the provider's own next `submit`
-(self-inflicted). That is what defeats intentional staling.
+Liveness across abandonment (no funds permanently stranded except one extreme tail):
+- **provider abandons** (claim filed, vanishes): client `settle`s around it (isolated); evaluator
+  `release`s or `reject(0)`s (terminate refunds *through* the claim); or any party `reject(hash)`s
+  the claim, after which anyone may post-expiry `claimRefund`.
+- **client abandons**: evaluator `release`s (pay provider) or `reject(0)`s (refund).
+- **evaluator abandons, claim pending**: provider/client can still `reject(hash)` the claim (then
+  anyone `claimRefund`s) and the client can `settle`. Only if **all three** parties are gone *and* a
+  claim is pending is the remainder stuck — an accepted extreme tail; the evaluator's `reject(0)`
+  and the any-party `reject(hash)` keep every realistic path live.
 
-**Post-expiry order-dependence (benign, by design).** `release` is intentionally not expiry-gated
-(a filed claim stays resolvable after expiry), so after expiry a pending claim can resolve **either**
-way depending on tx ordering between two legitimate parties: the evaluator/client `release`s it
-(pays the provider) **or** anyone `claimRefund`s (voids it, refunds the client). No funds are lost
-on either branch — the outcome is just whichever lands first. The provider's protection is to get
-the claim `release`d before expiry. This sits alongside the `reject(0)` residual in §5.
+**Asymmetry vs `settle` (deliberate).** `settle` is isolated but `claimRefund` is gated. The rule: a
+pending claim never blocks payment *toward* the provider (`settle`, `release`) but does block the
+*refund away* from them — the flag protects the claimant, never the counterparty's ability to pay.
+Blocking also removes the prior "release-vs-claimRefund race over a pending claim": while a claim
+pends, `claimRefund` simply reverts, so the only post-expiry actions on it are `release`/`reject`.
+
+This restores the target contract's original `settleClaim`-isolated / refund-gated semantics. The
+sole flag-behaviour MR9 keeps distinct from the `collapse-settlement-flow` option is the **isolated
+(vs blocked) `settle`**; `submit`-supersede and `claimRefund`-gating now match both the target and
+that option.
 
 ---
 
@@ -208,15 +220,16 @@ the claim `release`d before expiry. This sits alongside the `reject(0)` residual
 |---|---|---|---|---|
 | `submit` (file claim / deliver) | ✅ | — | — | — |
 | `settle` (originate payment) | — | ✅ | — | — |
-| `release` — approve a pending milestone claim | — | ✅ | ✅ | — |
+| `release` — approve a pending milestone claim | — | — | ✅ | — |
 | `release` — complete a Submitted final delivery | — | — | ✅ | — |
 | `reject(hash)` (cancel a claim) | ✅ | ✅ | ✅ | — |
 | `reject(0)` on Open (terminate, no escrow) | ✅ | ✅ | — | — |
 | `reject(0)` on Funded/Submitted (terminate + refund) | — | — | ✅ | — |
 | `claimRefund` (post-expiry) | ✅ | ✅ | ✅ | ✅ |
 
-Principle: originate = client; resolve = client or evaluator; **reverse/refund = evaluator only**;
-cancel-a-claim = anyone party (safe, strands nothing); the permissionless backstop = anyone.
+Principle: originate = client (`settle`); **resolve = evaluator only** (`release`, whether approving a
+milestone claim or completing a final delivery); **reverse/refund = evaluator only** (`reject(0)`);
+cancel-a-claim = any party (safe, strands nothing); the permissionless backstop = anyone.
 
 ---
 

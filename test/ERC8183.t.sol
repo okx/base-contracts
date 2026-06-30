@@ -1062,9 +1062,12 @@ contract ERC8183Test is Test {
         core.submit(jobId, fifteen, deliverable, "");
         assertEq(core.pendingClaimHash(jobId), _claimBindingHash(fifteen, deliverable, ""));
 
-        // Client tries to settle a different amount/deliverable directly -> reverts.
+        // A release that does NOT match the standing claim (wrong amount/deliverable)
+        // reverts — release must resolve the exact pending assertion. Tested with the
+        // authorized caller (evaluator); the client is rejected earlier (Unauthorized),
+        // covered by test_release_milestone_byClient_revertsUnauthorized.
         vm.expectRevert(ERC8183.NoPendingClaim.selector);
-        vm.prank(client);
+        vm.prank(evaluator);
         core.release(jobId, TEN_USDC, bytes32("direct"), "");
 
         // Matching the standing claim approves it; still Funded (15 < 20).
@@ -1077,7 +1080,7 @@ contract ERC8183Test is Test {
         assertEq(usdc.balanceOf(provider), fifteen);
     }
 
-    function test_claims_ClaimRefundVoidsPendingClaimAndRefundsFull() public {
+    function test_claims_ClaimRefundBlockedByPendingClaimThenResolve() public {
         uint48 expiry = _futureExpiry();
         vm.prank(client);
         uint256 jobId = core.createJob(provider, evaluator, expiry, "pending claim", address(0), 0);
@@ -1089,10 +1092,18 @@ contract ERC8183Test is Test {
         bytes32 deliverable = "milestone-1";
         vm.prank(provider);
         core.submit(jobId, TEN_USDC, deliverable, "");
+        bytes32 claimHash = core.pendingClaimHash(jobId);
 
-        // A pending claim does NOT block refund: claimRefund voids it permissionlessly and
-        // refunds the full remainder (the anti-stale backstop — no party action required).
+        // A pending claim BLOCKS the permissionless refund: the refund would erase the
+        // provider's standing assertion, so it must be resolved/cancelled first.
         vm.warp(uint256(expiry) + 1);
+        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        core.claimRefund(jobId);
+
+        // Resolve it (any party may cancel the claim by hash), then the refund goes through
+        // for the full remainder.
+        vm.prank(provider);
+        core.reject(jobId, claimHash, bytes32("withdrawn"), "");
         core.claimRefund(jobId);
 
         assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Expired));
@@ -1101,7 +1112,7 @@ contract ERC8183Test is Test {
         assertEq(usdc.balanceOf(address(core)), 0);
     }
 
-    function test_claims_SubmitBlockedByPendingClaimThenResolveAndComplete() public {
+    function test_claims_FinalSubmitSupersedesPendingClaimAndCompletes() public {
         uint256 jobId = _createFundedJob(TWENTY_USDC);
         bytes32 claimDeliverable = bytes32("milestone-1");
 
@@ -1110,15 +1121,11 @@ contract ERC8183Test is Test {
         bytes32 claimHash = core.pendingClaimHash(jobId);
         assertEq(claimHash, _claimBindingHash(TEN_USDC, claimDeliverable, ""));
 
-        // A pending claim must be resolved before the provider can move on: final submit
-        // does NOT supersede it — it reverts. ("Resolve before moving on.")
-        vm.expectRevert(ERC8183.PendingClaimExists.selector);
-        vm.prank(provider);
-        core.submit(jobId, TWENTY_USDC, bytes32("final"), "");
-
-        // Provider self-cancels their own claim, then submits the final delivery.
-        vm.prank(provider);
-        core.reject(jobId, claimHash, bytes32("withdrawn"), "");
+        // A final submit (cumulativeAmount == budget) SUPERSEDES the pending milestone claim:
+        // it voids the claim (ClaimRejected "superseded-by-submit") and moves the job to
+        // Submitted in a single tx — the provider need not separately reject the claim first.
+        vm.expectEmit(true, true, true, true, address(core));
+        emit ClaimRejected(jobId, provider, bytes32("superseded-by-submit"));
         vm.prank(provider);
         core.submit(jobId, TWENTY_USDC, bytes32("final"), "");
 
@@ -1155,7 +1162,7 @@ contract ERC8183Test is Test {
         assertEq(usdc.balanceOf(address(core)), 0);
     }
 
-    function test_claims_SubmitRevertsWhilePendingClaim_hookNeverFires() public {
+    function test_claims_FinalSubmitSupersedesPendingClaim_hookFires() public {
         PendingClaimObserverHook hook = new PendingClaimObserverHook(core);
         vm.prank(deployer);
         core.setHookWhitelist(address(hook), true);
@@ -1172,11 +1179,15 @@ contract ERC8183Test is Test {
         core.submit(jobId, TEN_USDC, claimDeliverable, "");
         assertEq(core.pendingClaimHash(jobId), _claimBindingHash(TEN_USDC, claimDeliverable, ""));
 
-        // Final submit no longer supersedes a pending claim — it reverts, so the hook never
-        // fires for the second submit. Resolve the claim first to move on.
-        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        // A final submit supersedes the pending claim and runs to completion, so the hook
+        // DOES fire (the claim is voided before the hook, effects-before-interactions, so the
+        // hook observes an already-cleared pending slot).
         vm.prank(provider);
         core.submit(jobId, TWENTY_USDC, bytes32("final"), "");
+
+        assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Submitted));
+        assertEq(core.pendingClaimHash(jobId), bytes32(0));
+        assertEq(hook.afterSubmitPendingClaimHash(), bytes32(0), "hook ran on the superseding submit");
     }
 
     function test_claims_RejectFundedJobClearsPendingClaim() public {
@@ -1294,7 +1305,7 @@ contract ERC8183Test is Test {
         assertEq(usdc.balanceOf(address(core)), TEN_USDC);
     }
 
-    function test_claims_ClaimRefundVoidsPendingClaimAfterPartialSettle() public {
+    function test_claims_ClaimRefundBlockedByStaleClaimAfterPartialSettle() public {
         uint48 expiry = _futureExpiry();
         vm.prank(client);
         uint256 jobId = core.createJob(provider, evaluator, expiry, "pending claim reject", address(0), 0);
@@ -1311,10 +1322,18 @@ contract ERC8183Test is Test {
         uint256 fifteenUsdc = 15_000_000;
         vm.prank(provider);
         core.submit(jobId, fifteenUsdc, bytes32("milestone-2"), "");
+        bytes32 claimHash = core.pendingClaimHash(jobId);
 
-        // After expiry, claimRefund voids the still-pending claim and refunds the REMAINDER
-        // (budget - settled = 20 - 10 = 10) to the client; the provider keeps the settled 10.
+        // After expiry, the still-pending (now stale) claim BLOCKS claimRefund — even a stale
+        // claim must be explicitly cancelled before the permissionless refund can run.
         vm.warp(uint256(expiry) + 30 days);
+        vm.expectRevert(ERC8183.PendingClaimExists.selector);
+        core.claimRefund(jobId);
+
+        // Cancel the stale claim by hash, then refund the REMAINDER (budget - settled = 10) to
+        // the client; the provider keeps the settled 10.
+        vm.prank(provider);
+        core.reject(jobId, claimHash, bytes32("withdraw-stale"), "");
         core.claimRefund(jobId);
 
         assertEq(uint8(core.getJob(jobId).status), uint8(ERC8183.JobStatus.Expired));
